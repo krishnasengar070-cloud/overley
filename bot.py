@@ -115,7 +115,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
     Rectangle + Circle. Longer videos supported.
     """
     if not shutil.which("ffmpeg"):
-        print("ffmpeg not found", flush=True)
+        print("ffmpeg not found - install ffmpeg on server", flush=True)
         return False
     if not os.path.exists(bg_path) or not os.path.exists(main_path):
         return False
@@ -204,14 +204,14 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             glow_vf_soft = (
                 f"format=rgba,"
                 f"geq=r='255':g='255':b='255':"
-                f"a='if(lte((X-W/2)*(X-W/2)+(Y-H/2)*(Y-H/2)\,(W/2)*(W/2))\,255\,0)',"
+                f"a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)',"
                 f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
                 f"boxblur=30:14,format=yuv420p"
             )
             glow_vf_mid = (
                 f"format=rgba,"
                 f"geq=r='255':g='255':b='255':"
-                f"a='if(lte((X-W/2)*(X-W/2)+(Y-H/2)*(Y-H/2)\,(W/2)*(W/2))\,255\,0)',"
+                f"a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)',"
                 f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
                 f"boxblur=14:6,format=yuv420p"
             )
