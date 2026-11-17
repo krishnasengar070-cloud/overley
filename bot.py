@@ -6,6 +6,7 @@ import asyncio
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+
 try:
     import imageio_ffmpeg
 except ImportError:
@@ -19,8 +20,13 @@ if not BOT_TOKEN:
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
+user_bg = {}
+user_circle = {}
+user_locks = {}
+
+
 def get_ffmpeg() -> str:
-    """Prefer system ffmpeg, else bundled imageio-ffmpeg binary (Railway-safe)."""
+    """System ffmpeg first, else bundled imageio-ffmpeg (works on Railway)."""
     if shutil.which("ffmpeg"):
         return "ffmpeg"
     if imageio_ffmpeg is not None:
@@ -34,10 +40,6 @@ def get_ffmpeg() -> str:
 
 
 FFMPEG = get_ffmpeg()
-
-user_bg = {}
-user_circle = {}
-user_locks = {}
 
 
 def get_lock(user_id: int) -> asyncio.Lock:
@@ -107,42 +109,65 @@ def cleanup(*paths):
                 pass
 
 
-def probe_duration(path: str) -> float:
+def probe_duration(path: str, ff: str) -> float:
+    """Duration via ffprobe if available, else ffmpeg, else default."""
+    # try ffprobe next to ffmpeg binary
+    candidates = ["ffprobe"]
+    if ff and ff != "ffmpeg":
+        # same folder as bundled ffmpeg
+        probe = os.path.join(os.path.dirname(ff), "ffprobe")
+        if os.path.exists(probe):
+            candidates.insert(0, probe)
+    for probe in candidates:
+        try:
+            r = subprocess.run(
+                [
+                    probe, "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return max(float(r.stdout.strip()), 0.5)
+        except Exception:
+            pass
+    # ffmpeg -i parse
     try:
         r = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                path,
-            ],
+            [ff, "-i", path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
         )
-        if r.stdout.strip():
-            return max(float(r.stdout.strip()), 0.5)
+        err = r.stderr or ""
+        import re
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", err)
+        if m:
+            h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            return max(h * 3600 + mi * 60 + s, 0.5)
     except Exception as e:
         print(f"probe err: {e}", flush=True)
     return 5.0
 
 
-def run_ff(cmd, timeout=600):
+def run_ff(cmd, timeout=900):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, text=True)
 
 
 def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False) -> bool:
     """
-    Reference-style soft white/cyan lightning bloom around main video.
-    Rectangle + Circle. Longer videos supported.
+    Soft white lightning bloom (reference style) around main video.
+    Rectangle + Circle. Long videos supported.
     """
     ff = get_ffmpeg()
     if not ff:
-        print("ffmpeg not found - install imageio-ffmpeg or system ffmpeg", flush=True)
+        print("ffmpeg not found - install imageio-ffmpeg", flush=True)
         return False
     if not os.path.exists(bg_path) or not os.path.exists(main_path):
         return False
 
-    duration = min(max(probe_duration(main_path), 0.5), 180.0)
-    print(f"compose duration={duration:.1f}s circle={circle}", flush=True)
+    duration = min(max(probe_duration(main_path, ff), 0.5), 300.0)
+    print(f"compose duration={duration:.1f}s circle={circle} ff={ff}", flush=True)
 
     uid = str(int(time.time() * 1000))
     bg_mp4 = f"tmp_bg_{uid}.mp4"
@@ -152,7 +177,6 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
     out_tmp = f"tmp_out_{uid}.mp4"
     W, H = 1080, 1920
 
-    # medium size (reference-ish panel)
     if circle:
         S = 700
         mw = mh = S
@@ -162,7 +186,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
     try:
         bg_ext = os.path.splitext(bg_path)[1].lower()
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
-        t_limit = max(150, int(duration * 5))
+        t_limit = max(180, int(duration * 6) + 60)
 
         # 1) background
         if is_image:
@@ -183,10 +207,10 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             ]
         r = run_ff(cmd_bg, timeout=t_limit)
         if r.returncode != 0 or not os.path.exists(bg_mp4) or os.path.getsize(bg_mp4) < 1000:
-            print("bg fail:", (r.stderr or "")[-400:], flush=True)
+            print("bg fail:", (r.stderr or "")[-500:], flush=True)
             return False
 
-        # 2) main panel scaled
+        # 2) main panel
         if circle:
             vf_main = f"scale={S}:{S}:force_original_aspect_ratio=increase,crop={S}:{S},setsar=1,fps=30,format=yuv420p"
         else:
@@ -202,37 +226,21 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             "-pix_fmt", "yuv420p", "-an", main_prep,
         ], timeout=t_limit)
         if r.returncode != 0 or not os.path.exists(main_prep) or os.path.getsize(main_prep) < 1000:
-            print("main fail:", (r.stderr or "")[-400:], flush=True)
+            print("main fail:", (r.stderr or "")[-500:], flush=True)
             return False
 
-        # 3) multi-layer soft lightning glow (reference style)
-        # Layer A: wide soft bloom (cyan-white)
-        # Layer B: tighter brighter rim
-        if circle:
-            # white filled circle then blur
-            glow_base = (
-                f"format=rgba,"
-                f"geq=r='255':g='255':b='255':"
-                f"a='if(lte((X-W/2)*(X-W/2)+(Y-H/2)*(Y-H/2)\\,(W/2)*(W/2))\\,255\\,0)'"
-            )
-        else:
-            glow_base = "format=rgba,geq=r='255':g='255':b='255':a='255'"
+        # 3) dual-layer soft lightning glow (pad so bloom expands outside frame)
+        pad_px = 56
+        circle_alpha = "a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)'"
 
-        # IMPORTANT: pad first so blur can expand OUTSIDE the video frame
-        # (without pad, glow gets clipped and looks like a thin line / missing)
-        pad_px = 48
         if circle:
             glow_vf_soft = (
-                f"format=rgba,"
-                f"geq=r='255':g='255':b='255':"
-                f"a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)',"
+                f"format=rgba,geq=r='255':g='255':b='255':{circle_alpha},"
                 f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
-                f"boxblur=30:14,format=yuv420p"
+                f"boxblur=32:14,format=yuv420p"
             )
             glow_vf_mid = (
-                f"format=rgba,"
-                f"geq=r='255':g='255':b='255':"
-                f"a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)',"
+                f"format=rgba,geq=r='255':g='255':b='255':{circle_alpha},"
                 f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
                 f"boxblur=14:6,format=yuv420p"
             )
@@ -240,7 +248,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             glow_vf_soft = (
                 f"format=rgba,geq=r='255':g='255':b='255':a='255',"
                 f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
-                f"boxblur=30:14,format=yuv420p"
+                f"boxblur=32:14,format=yuv420p"
             )
             glow_vf_mid = (
                 f"format=rgba,geq=r='255':g='255':b='255':a='255',"
@@ -272,13 +280,12 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
 
         print(f"glow soft={soft_ok} mid={mid_ok}", flush=True)
 
-        # 4) final stack: bg + soft glow + mid glow + sharp main (+ circle mask)
+        # 4) stack
         if circle:
-            # circular alpha on main
             main_masked = (
                 f"[1:v]format=rgba,"
                 f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-                f"a='if(lte((X-W/2)*(X-W/2)+(Y-H/2)*(Y-H/2)\\,(W/2)*(W/2))\\,255\\,0)'[main]"
+                f"{circle_alpha}[main]"
             )
             if soft_ok and mid_ok:
                 fc = (
@@ -305,7 +312,6 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
                 inputs = ["-i", bg_mp4, "-i", main_prep, "-i", main_path]
                 map_a = "2:a?"
         else:
-            # rectangle: thin bright edge + dual glow under it
             if soft_ok and mid_ok:
                 fc = (
                     f"[1:v]drawbox=0:0:iw:ih:color=white@0.75:t=4[main];"
@@ -343,16 +349,15 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             out_tmp,
-        ], timeout=max(200, int(duration * 6)))
+        ], timeout=max(240, int(duration * 8)))
 
         if r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
             print("final fail:", (r.stderr or "")[-600:], flush=True)
-            # simple white pad fallback
             if circle:
                 fc2 = (
                     f"[1:v]format=rgba,"
                     f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-                    f"a='if(lte((X-W/2)*(X-W/2)+(Y-H/2)*(Y-H/2)\\,(W/2)*(W/2))\\,255\\,0)'[main];"
+                    f"{circle_alpha}[main];"
                     f"[0:v][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
                 )
             else:
@@ -370,7 +375,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
                 "-c:a", "aac", "-b:a", "128k",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 out_tmp,
-            ], timeout=max(180, int(duration * 5)))
+            ], timeout=max(200, int(duration * 6)))
             if r2.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
                 print("fallback fail:", (r2.stderr or "")[-400:], flush=True)
                 return False
@@ -395,12 +400,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Overlay Bot\n\n"
         "1. Send image / GIF / short video → background\n"
-        "2. Send any video → overlay + soft lightning glow (reference style)\n"
+        "2. Send any video → overlay + soft lightning glow\n"
         "3. Circle Mode → circular frame + same glow\n"
         "4. Reset Background → clear background\n\n"
-        "Output 1080×1920. Longer videos supported.\n"
-        "DM only. Max download ~20 MB (Telegram limit).\n\n"
-        "Tip: Save the result to your device to see the real quality.\n"
+        "Output 1080×1920. Long videos supported.\n"
+        "DM only.\n\n"
+        "Tip: Save the result to your device to see real quality.\n"
         "Telegram chat preview can look different.",
         reply_markup=keyboard(),
     )
@@ -471,7 +476,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lock = get_lock(user_id)
 
     async with lock:
-        status = await message.reply_text("Processing... (long videos take time)")
+        status = await message.reply_text("Processing... (long videos take more time)")
         uid = str(int(time.time() * 1000))
         input_path = None
         output_path = None
@@ -516,15 +521,32 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.edit_text("Unsupported media.")
                 return
 
-            if file_obj.file_size and file_obj.file_size > 20 * 1024 * 1024:
+            # Soft size check — Telegram Bot API hard limit is ~20MB for download.
+            # Still try download; only warn if clearly huge.
+            size = getattr(file_obj, "file_size", None) or 0
+            if size > 50 * 1024 * 1024:
                 await status.edit_text(
-                    "File too large (Telegram bot max ~20 MB).\nCompress / trim then send again."
+                    "File is very large (50+ MB).\n"
+                    "Telegram bots can usually download only up to ~20 MB.\n"
+                    "Compress the video a bit and send again."
                 )
                 return
 
             input_path = f"in_{uid}{ext}"
-            tg_file = await context.bot.get_file(file_obj.file_id)
-            await tg_file.download_to_drive(input_path)
+            try:
+                tg_file = await context.bot.get_file(file_obj.file_id)
+                await tg_file.download_to_drive(input_path)
+            except Exception as dl_err:
+                err_s = str(dl_err).lower()
+                if "file is too big" in err_s or "too large" in err_s or "20" in err_s:
+                    await status.edit_text(
+                        "Telegram rejected download (file too large for bots, ~20 MB max).\n"
+                        "Compress / lower quality, then send again.\n"
+                        "Duration can be long — only file size matters for this limit."
+                    )
+                else:
+                    await status.edit_text(f"Download failed: {str(dl_err)[:120]}")
+                return
 
             bg = get_bg(user_id)
 
@@ -546,7 +568,9 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if not ok or not os.path.exists(output_path):
                 await status.edit_text(
-                    "Overlay failed.\nLong video? Wait and retry, or keep under 20 MB."
+                    "Overlay failed.\n"
+                    "Check Railway logs for ffmpeg errors.\n"
+                    "Long video? Wait and retry once."
                 )
                 return
 
@@ -557,16 +581,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         document=f,
                         caption="Done — soft lightning glow",
                         filename="overlay.mp4",
-                        read_timeout=180,
-                        write_timeout=180,
+                        read_timeout=300,
+                        write_timeout=300,
                     )
                 else:
                     await message.reply_video(
                         video=f,
                         caption="Done — soft lightning glow",
                         supports_streaming=True,
-                        read_timeout=180,
-                        write_timeout=180,
+                        read_timeout=300,
+                        write_timeout=300,
                     )
             try:
                 await status.delete()
@@ -589,15 +613,16 @@ def main():
     global FFMPEG
     FFMPEG = get_ffmpeg()
     if not FFMPEG:
-        print("WARNING: ffmpeg not found. Install imageio-ffmpeg package.")
+        print("WARNING: ffmpeg not found. Add imageio-ffmpeg to requirements.txt", flush=True)
     else:
         print(f"Using ffmpeg: {FFMPEG}", flush=True)
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .connect_timeout(60.0)
-        .read_timeout(180.0)
-        .write_timeout(180.0)
+        .read_timeout(300.0)
+        .write_timeout(300.0)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
