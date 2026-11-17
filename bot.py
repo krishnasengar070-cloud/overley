@@ -6,6 +6,10 @@ import asyncio
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -14,6 +18,22 @@ if not BOT_TOKEN:
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
+
+def get_ffmpeg() -> str:
+    """Prefer system ffmpeg, else bundled imageio-ffmpeg binary (Railway-safe)."""
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    if imageio_ffmpeg is not None:
+        try:
+            path = imageio_ffmpeg.get_ffmpeg_exe()
+            if path and os.path.exists(path):
+                return path
+        except Exception as e:
+            print(f"imageio-ffmpeg err: {e}", flush=True)
+    return ""
+
+
+FFMPEG = get_ffmpeg()
 
 user_bg = {}
 user_circle = {}
@@ -114,8 +134,9 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
     Reference-style soft white/cyan lightning bloom around main video.
     Rectangle + Circle. Longer videos supported.
     """
-    if not shutil.which("ffmpeg"):
-        print("ffmpeg not found - install ffmpeg on server", flush=True)
+    ff = get_ffmpeg()
+    if not ff:
+        print("ffmpeg not found - install imageio-ffmpeg or system ffmpeg", flush=True)
         return False
     if not os.path.exists(bg_path) or not os.path.exists(main_path):
         return False
@@ -146,7 +167,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
         # 1) background
         if is_image:
             cmd_bg = [
-                "ffmpeg", "-y", "-loop", "1", "-i", bg_path,
+                ff, "-y", "-loop", "1", "-i", bg_path,
                 "-t", f"{duration:.2f}",
                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
@@ -154,7 +175,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             ]
         else:
             cmd_bg = [
-                "ffmpeg", "-y", "-stream_loop", "-1", "-i", bg_path,
+                ff, "-y", "-stream_loop", "-1", "-i", bg_path,
                 "-t", f"{duration:.2f}",
                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
@@ -174,7 +195,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
                 f"pad={mw}:{mh}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p"
             )
         r = run_ff([
-            "ffmpeg", "-y", "-i", main_path,
+            ff, "-y", "-i", main_path,
             "-t", f"{duration:.2f}",
             "-vf", vf_main,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
@@ -228,7 +249,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             )
 
         r = run_ff([
-            "ffmpeg", "-y", "-i", main_prep,
+            ff, "-y", "-i", main_prep,
             "-t", f"{duration:.2f}",
             "-vf", glow_vf_soft,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
@@ -239,7 +260,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             print("soft glow fail:", (r.stderr or "")[-300:], flush=True)
 
         r = run_ff([
-            "ffmpeg", "-y", "-i", main_prep,
+            ff, "-y", "-i", main_prep,
             "-t", f"{duration:.2f}",
             "-vf", glow_vf_mid,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
@@ -311,7 +332,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
                 map_a = "2:a?"
 
         r = run_ff([
-            "ffmpeg", "-y",
+            ff, "-y",
             *inputs,
             "-filter_complex", fc,
             "-map", "[v]",
@@ -340,7 +361,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
                     f"[0:v][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
                 )
             r2 = run_ff([
-                "ffmpeg", "-y",
+                ff, "-y",
                 "-i", bg_mp4, "-i", main_prep, "-i", main_path,
                 "-filter_complex", fc2,
                 "-map", "[v]", "-map", "2:a?",
@@ -565,8 +586,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if not shutil.which("ffmpeg"):
-        print("WARNING: ffmpeg not found.")
+    global FFMPEG
+    FFMPEG = get_ffmpeg()
+    if not FFMPEG:
+        print("WARNING: ffmpeg not found. Install imageio-ffmpeg package.")
+    else:
+        print(f"Using ffmpeg: {FFMPEG}", flush=True)
     app = (
         Application.builder()
         .token(BOT_TOKEN)
