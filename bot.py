@@ -189,17 +189,23 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
     out_tmp = f"tmp_out_{uid}.mp4"
     W, H = 1080, 1920
 
+    # border size (white rim)
+    border = 18
+
     if circle:
-        mw = mh = 680
+        inner = 680
+        mw = mh = inner + border * 2
     else:
-        mw, mh = 700, 1244
+        inner_w, inner_h = 700, 1244
+        mw = inner_w + border * 2
+        mh = inner_h + border * 2
 
     try:
         bg_ext = os.path.splitext(bg_path_in)[1].lower()
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
         tlim = max(200, int(duration * 6) + 90)
 
-        # ---------- background ----------
+        # ---------- 1. Background ----------
         if is_image:
             cmd_bg = [
                 ff, "-y", "-loop", "1", "-i", bg_path_in,
@@ -221,18 +227,23 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             print("bg fail:", (r.stderr or "")[-600:], flush=True)
             return False
 
-        # ---------- main panel ----------
+        # ---------- 2. Main video + white border baked in ----------
         if circle:
+            # scale → crop to square → pad white border
             vf_main = (
-                f"scale={mw}:{mh}:force_original_aspect_ratio=increase,"
-                f"crop={mw}:{mh},setsar=1,fps=30,format=yuv420p"
+                f"scale={inner}:{inner}:force_original_aspect_ratio=increase,"
+                f"crop={inner}:{inner},"
+                f"pad={mw}:{mh}:{border}:{border}:color=white,"
+                f"setsar=1,fps=30,format=yuv420p"
             )
         else:
             vf_main = (
-                f"scale={mw}:{mh}:force_original_aspect_ratio=decrease,"
-                f"pad={mw}:{mh}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"scale={inner_w}:{inner_h}:force_original_aspect_ratio=decrease,"
+                f"pad={inner_w}:{inner_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"pad={mw}:{mh}:{border}:{border}:color=white,"
                 f"setsar=1,fps=30,format=yuv420p"
             )
+
         r = run_ff([
             ff, "-y", "-i", main_path,
             "-t", f"{duration:.2f}",
@@ -240,30 +251,19 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
             "-pix_fmt", "yuv420p", "-an", main_prep,
         ], timeout=tlim)
+
         if r.returncode != 0 or not os.path.exists(main_prep) or os.path.getsize(main_prep) < 1000:
             print("main fail:", (r.stderr or "")[-600:], flush=True)
             return False
 
-        # ---------- final composite (robust white glow) ----------
-        # 1. soft outer glow
-        # 2. thin bright white edge
-        # 3. main video on top
-        # No shortest=1, pure -t control
-        pad = 48
-        fc = (
-            f"[1:v]pad=iw+{pad*2}:ih+{pad*2}:{pad}:{pad}:color=white,"
-            f"boxblur=24:8[glow];"
-            f"[1:v]pad=iw+12:ih+12:6:6:color=white[edge];"
-            f"[0:v][glow]overlay=(W-w)/2:(H-h)/2[tmp1];"
-            f"[tmp1][edge]overlay=(W-w)/2:(H-h)/2[tmp2];"
-            f"[tmp2][1:v]overlay=(W-w)/2:(H-h)/2[v]"
-        )
+        # ---------- 3. Simple clean overlay (almost never fails) ----------
+        fc = f"[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]"
 
         r = run_ff([
             ff, "-y",
             "-i", bg_mp4,
             "-i", main_prep,
-            "-i", main_path,
+            "-i", main_path,          # for audio
             "-filter_complex", fc,
             "-map", "[v]",
             "-map", "2:a?",
@@ -276,34 +276,28 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         ], timeout=max(240, int(duration * 7)))
 
         if r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-            print("glow fail → simple white border:", (r.stderr or "")[-500:], flush=True)
+            print("overlay fail, trying without audio:", (r.stderr or "")[-500:], flush=True)
 
-            # ultra simple fallback – only white pad, almost never fails
-            fc2 = (
-                f"[1:v]pad={mw+20}:{mh+20}:10:10:color=white[m];"
-                f"[0:v][m]overlay=(W-w)/2:(H-h)/2[v]"
-            )
+            # last resort – video only
             r2 = run_ff([
                 ff, "-y",
                 "-i", bg_mp4,
                 "-i", main_prep,
-                "-i", main_path,
-                "-filter_complex", fc2,
+                "-filter_complex", fc,
                 "-map", "[v]",
-                "-map", "2:a?",
                 "-t", f"{duration:.2f}",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-                "-c:a", "aac", "-b:a", "128k",
+                "-an",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
                 out_tmp,
             ], timeout=max(180, int(duration * 5)))
 
             if r2.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-                print("fallback fail:", (r2.stderr or "")[-500:], flush=True)
+                print("final fail:", (r2.stderr or "")[-500:], flush=True)
                 return False
 
-        # auto compress if too big
+        # auto compress if big
         size = os.path.getsize(out_tmp)
         if size > 45 * 1024 * 1024:
             print(f"compressing {size // (1024*1024)}MB ...", flush=True)
@@ -340,12 +334,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Overlay Bot\n\n"
         "1. Send image / GIF / short video → background\n"
-        "2. Send any video → overlay + soft white glow\n"
+        "2. Send any video → overlay + white border\n"
         "3. Circle Mode → square frame mode\n"
         "4. Reset Background → clear\n\n"
         "Output: 1080x1920\n"
-        "DM only. Bot auto-compresses large files.\n\n"
-        "Tip: Save result to device for real quality.",
+        "DM only. Bot auto-compresses large files.",
         reply_markup=kb(),
     )
 
@@ -475,7 +468,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_bg(uid, input_path)
                 await status.edit_text(
                     "Background saved.\n\n"
-                    "Now send any video to overlay with soft glow.\n"
+                    "Now send any video to overlay.\n"
                     "Circle Mode toggles shape.\n"
                     "Reset Background clears it."
                 )
