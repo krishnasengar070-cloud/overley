@@ -186,6 +186,18 @@ def run_ff(cmd, timeout=900):
         return None
 
 
+def has_frames(path: str, ff: str) -> bool:
+    """Quick check that file has real video frames"""
+    try:
+        r = subprocess.run(
+            [ff, "-v", "error", "-i", path, "-t", "0.5", "-f", "null", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = False) -> bool:
     ff = get_ffmpeg()
     if not ff:
@@ -196,7 +208,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         print("missing files", flush=True)
         return False
 
-    # clean old temps
+    # clean old temps aggressively
     for f in os.listdir("."):
         if f.startswith("tmp_") and f.endswith(".mp4"):
             try:
@@ -235,12 +247,12 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
         tlim = max(300, int(duration * 10) + 150)
 
-        # 1. Background
+        # 1. Background - force clean pts
         if is_image:
             cmd = [
                 ff, "-y", "-loop", "1", "-i", bg_path_in,
                 "-t", f"{duration:.2f}",
-                "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
+                "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-pix_fmt", "yuv420p", "-an", bg_mp4,
             ]
@@ -248,31 +260,34 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             cmd = [
                 ff, "-y", "-stream_loop", "-1", "-i", bg_path_in,
                 "-t", f"{duration:.2f}",
-                "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
+                "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                 "-pix_fmt", "yuv420p", "-an", bg_mp4,
             ]
 
         r = run_ff(cmd, timeout=tlim)
         if not r or r.returncode != 0 or not os.path.exists(bg_mp4) or os.path.getsize(bg_mp4) < 2000:
-            print("BG FAIL:", (r.stderr if r else "")[-600:], flush=True)
+            print("BG FAIL:", (r.stderr if r else "")[-500:], flush=True)
+            return False
+        if not has_frames(bg_mp4, ff):
+            print("BG has no frames", flush=True)
             return False
         print("bg ok", flush=True)
 
-        # 2. Main + white border
+        # 2. Main + white border - force clean pts
         if circle:
             vf = (
                 f"scale={inner}:{inner}:force_original_aspect_ratio=increase,"
                 f"crop={inner}:{inner},"
                 f"pad={mw}:{mh}:{border}:{border}:color=white,"
-                f"setsar=1,fps=30,format=yuv420p"
+                f"setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS"
             )
         else:
             vf = (
                 f"scale={inner_w}:{inner_h}:force_original_aspect_ratio=decrease,"
                 f"pad={inner_w}:{inner_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
                 f"pad={mw}:{mh}:{border}:{border}:color=white,"
-                f"setsar=1,fps=30,format=yuv420p"
+                f"setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS"
             )
 
         r = run_ff([
@@ -284,22 +299,23 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         ], timeout=tlim)
 
         if not r or r.returncode != 0 or not os.path.exists(main_prep) or os.path.getsize(main_prep) < 2000:
-            print("MAIN FAIL:", (r.stderr if r else "")[-600:], flush=True)
+            print("MAIN FAIL:", (r.stderr if r else "")[-500:], flush=True)
+            return False
+        if not has_frames(main_prep, ff):
+            print("MAIN has no frames", flush=True)
             return False
         print("main ok", flush=True)
 
-        # 3. Overlay - robust version
-        fc = (
-            "[0:v]fps=30,format=yuv420p,setsar=1[bg];"
-            "[1:v]fps=30,format=yuv420p,setsar=1[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
-        )
+        # small pause to let filesystem settle
+        time.sleep(0.4)
 
+        # 3. Overlay - simplest possible + forced reset
         r = run_ff([
             ff, "-y",
+            "-fflags", "+genpts",
             "-i", bg_mp4,
             "-i", main_prep,
-            "-filter_complex", fc,
+            "-filter_complex", "[0:v][1:v]overlay=(W-w)/2:(H-h)/2:shortest=1[v]",
             "-map", "[v]",
             "-t", f"{duration:.2f}",
             "-r", "30",
@@ -311,12 +327,13 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         ], timeout=max(450, int(duration * 14)))
 
         if not r or r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-            print("OVERLAY try1 fail, trying simple...", flush=True)
+            print("OVERLAY1 fail, trying without shortest...", flush=True)
             r = run_ff([
                 ff, "-y",
                 "-i", bg_mp4,
                 "-i", main_prep,
-                "-filter_complex", "[0][1]overlay=(W-w)/2:(H-h)/2",
+                "-filter_complex", "[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]",
+                "-map", "[v]",
                 "-t", f"{duration:.2f}",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
                 "-an",
