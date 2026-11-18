@@ -3,6 +3,9 @@ import time
 import shutil
 import subprocess
 import asyncio
+import re
+from threading import Thread
+from flask import Flask
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -26,7 +29,6 @@ user_locks = {}
 
 
 def get_ffmpeg() -> str:
-    """System ffmpeg first, else bundled imageio-ffmpeg (works on Railway)."""
     if shutil.which("ffmpeg"):
         return "ffmpeg"
     if imageio_ffmpeg is not None:
@@ -39,7 +41,23 @@ def get_ffmpeg() -> str:
     return ""
 
 
-FFMPEG = get_ffmpeg()
+# ---------- Railway keep-alive (same idea as dupe bot) ----------
+app_flask = Flask(__name__)
+
+
+@app_flask.route("/")
+def home():
+    return "Overlay bot is alive!"
+
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host="0.0.0.0", port=port)
+
+
+def keep_alive():
+    t = Thread(target=run_flask, daemon=True)
+    t.start()
 
 
 def get_lock(user_id: int) -> asyncio.Lock:
@@ -110,11 +128,8 @@ def cleanup(*paths):
 
 
 def probe_duration(path: str, ff: str) -> float:
-    """Duration via ffprobe if available, else ffmpeg, else default."""
-    # try ffprobe next to ffmpeg binary
     candidates = ["ffprobe"]
     if ff and ff != "ffmpeg":
-        # same folder as bundled ffmpeg
         probe = os.path.join(os.path.dirname(ff), "ffprobe")
         if os.path.exists(probe):
             candidates.insert(0, probe)
@@ -133,14 +148,12 @@ def probe_duration(path: str, ff: str) -> float:
                 return max(float(r.stdout.strip()), 0.5)
         except Exception:
             pass
-    # ffmpeg -i parse
     try:
         r = subprocess.run(
             [ff, "-i", path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30,
         )
         err = r.stderr or ""
-        import re
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", err)
         if m:
             h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
@@ -156,8 +169,8 @@ def run_ff(cmd, timeout=900):
 
 def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False) -> bool:
     """
-    Soft white lightning bloom (reference style) around main video.
-    Rectangle + Circle. Long videos supported.
+    9:16 overlay + soft white glow border.
+    Simplified for Railway / imageio-ffmpeg reliability.
     """
     ff = get_ffmpeg()
     if not ff:
@@ -166,14 +179,12 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
     if not os.path.exists(bg_path) or not os.path.exists(main_path):
         return False
 
-    duration = min(max(probe_duration(main_path, ff), 0.5), 300.0)
+    duration = min(max(probe_duration(main_path, ff), 0.5), 180.0)
     print(f"compose duration={duration:.1f}s circle={circle} ff={ff}", flush=True)
 
     uid = str(int(time.time() * 1000))
     bg_mp4 = f"tmp_bg_{uid}.mp4"
     main_prep = f"tmp_main_{uid}.mp4"
-    glow_soft = f"tmp_glow_s_{uid}.mp4"
-    glow_mid = f"tmp_glow_m_{uid}.mp4"
     out_tmp = f"tmp_out_{uid}.mp4"
     W, H = 1080, 1920
 
@@ -186,7 +197,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
     try:
         bg_ext = os.path.splitext(bg_path)[1].lower()
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
-        t_limit = max(180, int(duration * 6) + 60)
+        t_limit = max(180, int(duration * 5) + 60)
 
         # 1) background
         if is_image:
@@ -210,13 +221,18 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             print("bg fail:", (r.stderr or "")[-500:], flush=True)
             return False
 
-        # 2) main panel
+        # 2) main panel (simple scale/pad — no fragile geq)
         if circle:
-            vf_main = f"scale={S}:{S}:force_original_aspect_ratio=increase,crop={S}:{S},setsar=1,fps=30,format=yuv420p"
+            # square first; circular look via vignette-ish pad later if needed
+            vf_main = (
+                f"scale={S}:{S}:force_original_aspect_ratio=increase,"
+                f"crop={S}:{S},setsar=1,fps=30,format=yuv420p"
+            )
         else:
             vf_main = (
                 f"scale={mw}:{mh}:force_original_aspect_ratio=decrease,"
-                f"pad={mw}:{mh}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30,format=yuv420p"
+                f"pad={mw}:{mh}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"setsar=1,fps=30,format=yuv420p"
             )
         r = run_ff([
             ff, "-y", "-i", main_path,
@@ -229,135 +245,51 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
             print("main fail:", (r.stderr or "")[-500:], flush=True)
             return False
 
-        # 3) dual-layer soft lightning glow (pad so bloom expands outside frame)
-        pad_px = 56
-        circle_alpha = "a='if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(W/2,2)),255,0)'"
-
+        # 3) final: soft white outer glow via pad + boxblur underlay (reliable)
+        # glow plate = white rect/square blurred larger than main
+        pad_px = 48
         if circle:
-            glow_vf_soft = (
-                f"format=rgba,geq=r='255':g='255':b='255':{circle_alpha},"
-                f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
-                f"boxblur=32:14,format=yuv420p"
-            )
-            glow_vf_mid = (
-                f"format=rgba,geq=r='255':g='255':b='255':{circle_alpha},"
-                f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
-                f"boxblur=14:6,format=yuv420p"
+            # approximate circle glow: pad white then blur, overlay main square centered
+            fc = (
+                f"[1:v]pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=white,"
+                f"boxblur=24:10[glow];"
+                f"[1:v]pad=iw+8:ih+8:4:4:color=white[rim];"
+                f"[0:v][glow]overlay=(W-w)/2:(H-h)/2[t1];"
+                f"[t1][rim]overlay=(W-w)/2:(H-h)/2[t2];"
+                f"[t2][1:v]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
             )
         else:
-            glow_vf_soft = (
-                f"format=rgba,geq=r='255':g='255':b='255':a='255',"
-                f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
-                f"boxblur=32:14,format=yuv420p"
+            fc = (
+                f"[1:v]pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=white,"
+                f"boxblur=28:12[glow];"
+                f"[1:v]drawbox=0:0:iw:ih:color=white@0.85:t=5[rim];"
+                f"[0:v][glow]overlay=(W-w)/2:(H-h)/2[t1];"
+                f"[t1][rim]overlay=(W-w)/2:(H-h)/2[t2];"
+                f"[t2][1:v]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
             )
-            glow_vf_mid = (
-                f"format=rgba,geq=r='255':g='255':b='255':a='255',"
-                f"pad=iw+{pad_px*2}:ih+{pad_px*2}:{pad_px}:{pad_px}:color=black@0,"
-                f"boxblur=14:6,format=yuv420p"
-            )
-
-        r = run_ff([
-            ff, "-y", "-i", main_prep,
-            "-t", f"{duration:.2f}",
-            "-vf", glow_vf_soft,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-pix_fmt", "yuv420p", "-an", glow_soft,
-        ], timeout=t_limit)
-        soft_ok = r.returncode == 0 and os.path.exists(glow_soft) and os.path.getsize(glow_soft) > 500
-        if not soft_ok:
-            print("soft glow fail:", (r.stderr or "")[-300:], flush=True)
-
-        r = run_ff([
-            ff, "-y", "-i", main_prep,
-            "-t", f"{duration:.2f}",
-            "-vf", glow_vf_mid,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-pix_fmt", "yuv420p", "-an", glow_mid,
-        ], timeout=t_limit)
-        mid_ok = r.returncode == 0 and os.path.exists(glow_mid) and os.path.getsize(glow_mid) > 500
-        if not mid_ok:
-            print("mid glow fail:", (r.stderr or "")[-300:], flush=True)
-
-        print(f"glow soft={soft_ok} mid={mid_ok}", flush=True)
-
-        # 4) stack
-        if circle:
-            main_masked = (
-                f"[1:v]format=rgba,"
-                f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-                f"{circle_alpha}[main]"
-            )
-            if soft_ok and mid_ok:
-                fc = (
-                    f"{main_masked};"
-                    f"[0:v][2:v]overlay=(W-w)/2:(H-h)/2[t1];"
-                    f"[t1][3:v]overlay=(W-w)/2:(H-h)/2[t2];"
-                    f"[t2][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-                )
-                inputs = ["-i", bg_mp4, "-i", main_prep, "-i", glow_soft, "-i", glow_mid, "-i", main_path]
-                map_a = "4:a?"
-            elif soft_ok:
-                fc = (
-                    f"{main_masked};"
-                    f"[0:v][2:v]overlay=(W-w)/2:(H-h)/2[t1];"
-                    f"[t1][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-                )
-                inputs = ["-i", bg_mp4, "-i", main_prep, "-i", glow_soft, "-i", main_path]
-                map_a = "3:a?"
-            else:
-                fc = (
-                    f"{main_masked};"
-                    f"[0:v][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-                )
-                inputs = ["-i", bg_mp4, "-i", main_prep, "-i", main_path]
-                map_a = "2:a?"
-        else:
-            if soft_ok and mid_ok:
-                fc = (
-                    f"[1:v]drawbox=0:0:iw:ih:color=white@0.75:t=4[main];"
-                    f"[0:v][2:v]overlay=(W-w)/2:(H-h)/2[t1];"
-                    f"[t1][3:v]overlay=(W-w)/2:(H-h)/2[t2];"
-                    f"[t2][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-                )
-                inputs = ["-i", bg_mp4, "-i", main_prep, "-i", glow_soft, "-i", glow_mid, "-i", main_path]
-                map_a = "4:a?"
-            elif soft_ok:
-                fc = (
-                    f"[1:v]drawbox=0:0:iw:ih:color=white@0.75:t=4[main];"
-                    f"[0:v][2:v]overlay=(W-w)/2:(H-h)/2[t1];"
-                    f"[t1][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-                )
-                inputs = ["-i", bg_mp4, "-i", main_prep, "-i", glow_soft, "-i", main_path]
-                map_a = "3:a?"
-            else:
-                fc = (
-                    f"[1:v]pad={mw+18}:{mh+18}:9:9:color=0xE8F4FF[main];"
-                    f"[0:v][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-                )
-                inputs = ["-i", bg_mp4, "-i", main_prep, "-i", main_path]
-                map_a = "2:a?"
 
         r = run_ff([
             ff, "-y",
-            *inputs,
+            "-i", bg_mp4,
+            "-i", main_prep,
+            "-i", main_path,
             "-filter_complex", fc,
             "-map", "[v]",
-            "-map", map_a,
+            "-map", "2:a?",
             "-t", f"{duration:.2f}",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "19",
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             out_tmp,
-        ], timeout=max(240, int(duration * 8)))
+        ], timeout=max(240, int(duration * 6)))
 
         if r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-            print("final fail:", (r.stderr or "")[-600:], flush=True)
+            print("glow compose fail, simple border:", (r.stderr or "")[-500:], flush=True)
+            # simple white pad border fallback
             if circle:
                 fc2 = (
-                    f"[1:v]format=rgba,"
-                    f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
-                    f"{circle_alpha}[main];"
+                    f"[1:v]pad={S+16}:{S+16}:8:8:color=white[main];"
                     f"[0:v][main]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
                 )
             else:
@@ -375,7 +307,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
                 "-c:a", "aac", "-b:a", "128k",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 out_tmp,
-            ], timeout=max(200, int(duration * 6)))
+            ], timeout=max(180, int(duration * 5)))
             if r2.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
                 print("fallback fail:", (r2.stderr or "")[-400:], flush=True)
                 return False
@@ -390,7 +322,7 @@ def compose(bg_path: str, main_path: str, output_path: str, circle: bool = False
         print(f"compose error: {e}", flush=True)
         return False
     finally:
-        cleanup(bg_mp4, main_prep, glow_soft, glow_mid, out_tmp)
+        cleanup(bg_mp4, main_prep, out_tmp)
         for f in list(os.listdir(".")):
             if uid in f and f.startswith("tmp_"):
                 cleanup(f)
@@ -401,7 +333,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Overlay Bot\n\n"
         "1. Send image / GIF / short video → background\n"
         "2. Send any video → overlay + soft lightning glow\n"
-        "3. Circle Mode → circular frame + same glow\n"
+        "3. Circle Mode → circular-style frame + same glow\n"
         "4. Reset Background → clear background\n\n"
         "Output 1080×1920. Long videos supported.\n"
         "DM only.\n\n"
@@ -450,7 +382,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         on = not is_circle(user_id)
         set_circle(user_id, on)
         msg = (
-            "Circle Mode ON ✅\nCircular frame + soft lightning glow."
+            "Circle Mode ON ✅\nFrame + soft lightning glow."
             if on else
             "Circle Mode OFF\nRectangle frame + soft lightning glow."
         )
@@ -521,8 +453,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.edit_text("Unsupported media.")
                 return
 
-            # Soft size check — Telegram Bot API hard limit is ~20MB for download.
-            # Still try download; only warn if clearly huge.
             size = getattr(file_obj, "file_size", None) or 0
             if size > 50 * 1024 * 1024:
                 await status.edit_text(
@@ -541,8 +471,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if "file is too big" in err_s or "too large" in err_s or "20" in err_s:
                     await status.edit_text(
                         "Telegram rejected download (file too large for bots, ~20 MB max).\n"
-                        "Compress / lower quality, then send again.\n"
-                        "Duration can be long — only file size matters for this limit."
+                        "Compress / lower quality, then send again."
                     )
                 else:
                     await status.edit_text(f"Download failed: {str(dl_err)[:120]}")
@@ -569,8 +498,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not ok or not os.path.exists(output_path):
                 await status.edit_text(
                     "Overlay failed.\n"
-                    "Check Railway logs for ffmpeg errors.\n"
-                    "Long video? Wait and retry once."
+                    "Check Railway logs for: Using ffmpeg: ...\n"
+                    "If ffmpeg missing, requirements.txt must include imageio-ffmpeg."
                 )
                 return
 
@@ -610,12 +539,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    global FFMPEG
-    FFMPEG = get_ffmpeg()
-    if not FFMPEG:
-        print("WARNING: ffmpeg not found. Add imageio-ffmpeg to requirements.txt", flush=True)
+    keep_alive()  # Railway PORT health
+
+    ff = get_ffmpeg()
+    if not ff:
+        print("WARNING: ffmpeg not found. requirements.txt must have imageio-ffmpeg", flush=True)
     else:
-        print(f"Using ffmpeg: {FFMPEG}", flush=True)
+        print(f"Using ffmpeg: {ff}", flush=True)
 
     app = (
         Application.builder()
@@ -633,7 +563,15 @@ def main():
         handle_media,
     ))
     print("Overlay bot started...", flush=True)
-    app.run_polling(drop_pending_updates=True)
+
+    while True:
+        try:
+            app.run_polling(drop_pending_updates=True, close_loop=False)
+        except Exception as e:
+            print(f"[RESTART] {e}", flush=True)
+            time.sleep(5)
+            continue
+        break
 
 
 if __name__ == "__main__":
