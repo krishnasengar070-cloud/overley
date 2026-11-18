@@ -196,6 +196,14 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         print("missing files", flush=True)
         return False
 
+    # clean old temps
+    for f in os.listdir("."):
+        if f.startswith("tmp_") and f.endswith(".mp4"):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
     raw = probe_duration(main_path, ff)
     duration = min(max(raw, 0.5), MAX_DURATION)
     print(f"compose raw={raw:.1f}s use={duration:.1f}s circle={circle}", flush=True)
@@ -227,7 +235,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
         tlim = max(300, int(duration * 10) + 150)
 
-        # ---- 1. Background ----
+        # 1. Background
         if is_image:
             cmd = [
                 ff, "-y", "-loop", "1", "-i", bg_path_in,
@@ -251,7 +259,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             return False
         print("bg ok", flush=True)
 
-        # ---- 2. Main + white border ----
+        # 2. Main + white border
         if circle:
             vf = (
                 f"scale={inner}:{inner}:force_original_aspect_ratio=increase,"
@@ -280,27 +288,49 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             return False
         print("main ok", flush=True)
 
-        # ---- 3. Overlay (video only) ----
+        # 3. Overlay - robust version
+        fc = (
+            "[0:v]fps=30,format=yuv420p,setsar=1[bg];"
+            "[1:v]fps=30,format=yuv420p,setsar=1[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
+        )
+
         r = run_ff([
             ff, "-y",
             "-i", bg_mp4,
             "-i", main_prep,
-            "-filter_complex", "[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]",
+            "-filter_complex", fc,
             "-map", "[v]",
             "-t", f"{duration:.2f}",
+            "-r", "30",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(crf),
             "-an",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             out_tmp,
-        ], timeout=max(400, int(duration * 12)))
+        ], timeout=max(450, int(duration * 14)))
 
         if not r or r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-            print("OVERLAY FAIL:", (r.stderr if r else "")[-600:], flush=True)
-            return False
+            print("OVERLAY try1 fail, trying simple...", flush=True)
+            r = run_ff([
+                ff, "-y",
+                "-i", bg_mp4,
+                "-i", main_prep,
+                "-filter_complex", "[0][1]overlay=(W-w)/2:(H-h)/2",
+                "-t", f"{duration:.2f}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+                "-an",
+                "-pix_fmt", "yuv420p",
+                out_tmp,
+            ], timeout=max(400, int(duration * 12)))
+
+            if not r or r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
+                print("OVERLAY FAIL:", (r.stderr if r else "")[-500:], flush=True)
+                return False
+
         print("overlay ok", flush=True)
 
-        # ---- 4. Try add audio ----
+        # 4. Add audio
         final = f"tmp_final_{uid}.mp4"
         r2 = run_ff([
             ff, "-y",
@@ -322,9 +352,9 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         else:
             print("audio skipped", flush=True)
 
-        # ---- 5. Compress if big ----
+        # 5. Compress
         size = os.path.getsize(out_tmp)
-        if size > 38 * 1024 * 1024 or duration > 20:
+        if size > 38 * 1024 * 1024 or duration > 18:
             print(f"compressing {size//(1024*1024)}MB", flush=True)
             comp = f"tmp_comp_{uid}.mp4"
             r3 = run_ff([
