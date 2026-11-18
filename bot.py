@@ -29,7 +29,6 @@ user_circle = {}
 user_locks = {}
 
 
-# ===================== FFMPEG =====================
 def get_ffmpeg() -> str:
     if shutil.which("ffmpeg"):
         return "ffmpeg"
@@ -43,7 +42,6 @@ def get_ffmpeg() -> str:
     return ""
 
 
-# ===================== RAILWAY HEALTH =====================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = b"ok"
@@ -71,7 +69,6 @@ def start_health_server():
     Thread(target=run, daemon=True).start()
 
 
-# ===================== HELPERS =====================
 def get_lock(uid: int) -> asyncio.Lock:
     if uid not in user_locks:
         user_locks[uid] = asyncio.Lock()
@@ -140,7 +137,6 @@ def cleanup(*paths):
 
 
 def probe_duration(path: str, ff: str) -> float:
-    # try ffprobe
     probes = ["ffprobe"]
     if ff and ff != "ffmpeg":
         near = os.path.join(os.path.dirname(ff), "ffprobe")
@@ -157,7 +153,6 @@ def probe_duration(path: str, ff: str) -> float:
                 return max(float(r.stdout.strip()), 0.5)
         except Exception:
             pass
-    # parse ffmpeg -i
     try:
         r = subprocess.run(
             [ff, "-i", path],
@@ -177,13 +172,7 @@ def run_ff(cmd, timeout=600):
     )
 
 
-# ===================== COMPOSE =====================
 def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = False) -> bool:
-    """
-    1080x1920 overlay.
-    Main video centered with soft white glow border.
-    Background loops / freezes to match duration.
-    """
     ff = get_ffmpeg()
     if not ff:
         print("ERROR: ffmpeg not found", flush=True)
@@ -210,7 +199,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
         tlim = max(200, int(duration * 6) + 90)
 
-        # --- background ---
+        # background
         if is_image:
             cmd_bg = [
                 ff, "-y", "-loop", "1", "-i", bg_path_in,
@@ -232,7 +221,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             print("bg fail:", (r.stderr or "")[-600:], flush=True)
             return False
 
-        # --- main scaled ---
+        # main scaled
         if circle:
             vf_main = (
                 f"scale={mw}:{mh}:force_original_aspect_ratio=increase,"
@@ -255,8 +244,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             print("main fail:", (r.stderr or "")[-600:], flush=True)
             return False
 
-        # --- final: soft white glow (pad+blur under main) + thin bright edge ---
-        # No geq / no fragile alpha expressions — works on imageio-ffmpeg builds
+        # soft white glow + thin bright edge (working version)
         pad = 40
         fc = (
             f"[1:v]pad=iw+{pad*2}:ih+{pad*2}:{pad}:{pad}:color=white,"
@@ -303,6 +291,24 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
                 print("fallback fail:", (r2.stderr or "")[-400:], flush=True)
                 return False
 
+        # auto compress if too big for Telegram
+        size = os.path.getsize(out_tmp)
+        if size > 45 * 1024 * 1024:
+            print(f"compressing {size // (1024*1024)}MB ...", flush=True)
+            comp = f"tmp_comp_{uid}.mp4"
+            r3 = run_ff([
+                ff, "-y", "-i", out_tmp,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+                "-c:a", "aac", "-b:a", "96k",
+                "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+                comp,
+            ], timeout=max(180, int(duration * 5)))
+            if r3.returncode == 0 and os.path.exists(comp) and os.path.getsize(comp) > 3000:
+                cleanup(out_tmp)
+                out_tmp = comp
+            else:
+                print("compress fail, sending original", flush=True)
+
         shutil.move(out_tmp, output_path)
         print(f"OK {os.path.getsize(output_path)} bytes", flush=True)
         return True
@@ -320,7 +326,6 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
                 cleanup(f)
 
 
-# ===================== HANDLERS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Overlay Bot\n\n"
@@ -330,7 +335,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4. Reset Background → clear\n\n"
         "Output: 1080x1920\n"
         "DM only. Videos up to ~20 MB (Telegram limit).\n"
-        "Long duration OK if size is under limit.\n\n"
+        "Bot auto-compresses if output is large.\n\n"
         "Tip: Save result to device to see real quality.",
         reply_markup=kb(),
     )
@@ -517,7 +522,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cleanup(f)
 
 
-# ===================== MAIN =====================
 def main():
     start_health_server()
 
