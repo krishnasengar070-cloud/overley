@@ -28,6 +28,10 @@ user_bg = {}
 user_circle = {}
 user_locks = {}
 
+MAX_DURATION = 60.0          # up to 60 seconds
+TARGET_CRF_SHORT = 18        # < 15s
+TARGET_CRF_LONG = 23         # longer clips
+
 
 def get_ffmpeg() -> str:
     if shutil.which("ffmpeg"):
@@ -137,36 +141,47 @@ def cleanup(*paths):
 
 
 def probe_duration(path: str, ff: str) -> float:
+    """More reliable duration probe"""
+    # 1. ffprobe
     probes = ["ffprobe"]
     if ff and ff != "ffmpeg":
         near = os.path.join(os.path.dirname(ff), "ffprobe")
         if os.path.exists(near):
             probes.insert(0, near)
+
     for probe in probes:
         try:
             r = subprocess.run(
                 [probe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=25,
             )
             if r.returncode == 0 and r.stdout.strip():
-                return max(float(r.stdout.strip()), 0.5)
+                d = float(r.stdout.strip())
+                if d > 0.3:
+                    return d
         except Exception:
             pass
+
+    # 2. ffmpeg -i parse
     try:
         r = subprocess.run(
             [ff, "-i", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=25,
         )
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", r.stderr or "")
         if m:
-            return max(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)), 0.5)
+            d = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            if d > 0.3:
+                return d
     except Exception:
         pass
-    return 5.0
+
+    # 3. fallback
+    return 8.0
 
 
-def run_ff(cmd, timeout=600):
+def run_ff(cmd, timeout=900):
     return subprocess.run(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, text=True
     )
@@ -180,17 +195,20 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
     if not os.path.exists(bg_path_in) or not os.path.exists(main_path):
         return False
 
-    duration = min(max(probe_duration(main_path, ff), 0.5), 180.0)
-    print(f"compose d={duration:.1f}s circle={circle}", flush=True)
+    raw = probe_duration(main_path, ff)
+    duration = min(max(raw, 0.5), MAX_DURATION)
+    print(f"compose raw={raw:.1f}s → use={duration:.1f}s circle={circle}", flush=True)
+
+    # quality based on length
+    crf = TARGET_CRF_SHORT if duration <= 15 else TARGET_CRF_LONG
+    preset = "ultrafast"
 
     uid = str(int(time.time() * 1000))
     bg_mp4 = f"tmp_bg_{uid}.mp4"
     main_prep = f"tmp_main_{uid}.mp4"
     out_tmp = f"tmp_out_{uid}.mp4"
     W, H = 1080, 1920
-
-    # border size (white rim)
-    border = 18
+    border = 16
 
     if circle:
         inner = 680
@@ -203,15 +221,15 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
     try:
         bg_ext = os.path.splitext(bg_path_in)[1].lower()
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
-        tlim = max(200, int(duration * 6) + 90)
+        tlim = max(300, int(duration * 10) + 120)
 
-        # ---------- 1. Background ----------
+        # ---------- Background ----------
         if is_image:
             cmd_bg = [
                 ff, "-y", "-loop", "1", "-i", bg_path_in,
                 "-t", f"{duration:.2f}",
                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-c:v", "libx264", "-preset", preset, "-crf", "28",
                 "-pix_fmt", "yuv420p", "-an", bg_mp4,
             ]
         else:
@@ -219,17 +237,17 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
                 ff, "-y", "-stream_loop", "-1", "-i", bg_path_in,
                 "-t", f"{duration:.2f}",
                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-c:v", "libx264", "-preset", preset, "-crf", "28",
                 "-pix_fmt", "yuv420p", "-an", bg_mp4,
             ]
         r = run_ff(cmd_bg, timeout=tlim)
         if r.returncode != 0 or not os.path.exists(bg_mp4) or os.path.getsize(bg_mp4) < 1000:
-            print("bg fail:", (r.stderr or "")[-600:], flush=True)
+            print("bg fail:", (r.stderr or "")[-700:], flush=True)
             return False
+        print("bg ok", flush=True)
 
-        # ---------- 2. Main video + white border baked in ----------
+        # ---------- Main + white border ----------
         if circle:
-            # scale → crop to square → pad white border
             vf_main = (
                 f"scale={inner}:{inner}:force_original_aspect_ratio=increase,"
                 f"crop={inner}:{inner},"
@@ -248,37 +266,37 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             ff, "-y", "-i", main_path,
             "-t", f"{duration:.2f}",
             "-vf", vf_main,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
             "-pix_fmt", "yuv420p", "-an", main_prep,
         ], timeout=tlim)
 
         if r.returncode != 0 or not os.path.exists(main_prep) or os.path.getsize(main_prep) < 1000:
-            print("main fail:", (r.stderr or "")[-600:], flush=True)
+            print("main fail:", (r.stderr or "")[-700:], flush=True)
             return False
+        print("main ok", flush=True)
 
-        # ---------- 3. Simple clean overlay (almost never fails) ----------
-        fc = f"[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]"
+        # ---------- Final overlay (simple) ----------
+        fc = "[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]"
 
+        # First try with audio
         r = run_ff([
             ff, "-y",
             "-i", bg_mp4,
             "-i", main_prep,
-            "-i", main_path,          # for audio
+            "-i", main_path,
             "-filter_complex", fc,
             "-map", "[v]",
             "-map", "2:a?",
             "-t", f"{duration:.2f}",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "19",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+            "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             out_tmp,
-        ], timeout=max(240, int(duration * 7)))
+        ], timeout=max(400, int(duration * 12)))
 
         if r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-            print("overlay fail, trying without audio:", (r.stderr or "")[-500:], flush=True)
-
-            # last resort – video only
+            print("with-audio fail → video only", flush=True)
             r2 = run_ff([
                 ff, "-y",
                 "-i", bg_mp4,
@@ -286,29 +304,29 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
                 "-filter_complex", fc,
                 "-map", "[v]",
                 "-t", f"{duration:.2f}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                "-c:v", "libx264", "-preset", preset, "-crf", str(crf + 2),
                 "-an",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
                 out_tmp,
-            ], timeout=max(180, int(duration * 5)))
+            ], timeout=max(300, int(duration * 10)))
 
             if r2.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-                print("final fail:", (r2.stderr or "")[-500:], flush=True)
+                print("final fail:", (r2.stderr or "")[-600:], flush=True)
                 return False
 
-        # auto compress if big
+        # Force compress if still large
         size = os.path.getsize(out_tmp)
-        if size > 45 * 1024 * 1024:
-            print(f"compressing {size // (1024*1024)}MB ...", flush=True)
+        if size > 42 * 1024 * 1024 or duration > 20:
+            print(f"compressing {size//(1024*1024)}MB ...", flush=True)
             comp = f"tmp_comp_{uid}.mp4"
             r3 = run_ff([
                 ff, "-y", "-i", out_tmp,
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-                "-c:a", "aac", "-b:a", "96k",
+                "-c:a", "aac", "-b:a", "80k",
                 "-movflags", "+faststart", "-pix_fmt", "yuv420p",
                 comp,
-            ], timeout=max(180, int(duration * 5)))
+            ], timeout=max(240, int(duration * 8)))
             if r3.returncode == 0 and os.path.exists(comp) and os.path.getsize(comp) > 3000:
                 cleanup(out_tmp)
                 out_tmp = comp
@@ -335,10 +353,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Overlay Bot\n\n"
         "1. Send image / GIF / short video → background\n"
         "2. Send any video → overlay + white border\n"
-        "3. Circle Mode → square frame mode\n"
-        "4. Reset Background → clear\n\n"
-        "Output: 1080x1920\n"
-        "DM only. Bot auto-compresses large files.",
+        "3. Circle Mode / Reset Background\n\n"
+        "Supports up to 60 seconds.\n"
+        "Longer clips are auto-compressed.\n"
+        "DM only.",
         reply_markup=kb(),
     )
 
@@ -352,7 +370,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "How to use\n\n"
         f"Status: {status}\n"
         f"Shape: {mode}\n\n"
-        "Send media for background, then a video to overlay.",
+        "Send media for background, then a video to overlay.\n"
+        "Max ~60 seconds supported.",
         reply_markup=kb(),
     )
 
@@ -481,7 +500,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if not ok or not os.path.exists(output_path):
                 await status.edit_text(
-                    "Overlay failed. Check Railway logs for ffmpeg errors."
+                    "Overlay failed. Check Railway logs."
                 )
                 return
 
