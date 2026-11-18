@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.error import Conflict
 
 try:
     import imageio_ffmpeg
@@ -150,7 +151,7 @@ def probe_duration(path: str, ff: str) -> float:
             r = subprocess.run(
                 [probe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=25,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
             )
             if r.returncode == 0 and r.stdout.strip():
                 d = float(r.stdout.strip())
@@ -162,7 +163,7 @@ def probe_duration(path: str, ff: str) -> float:
     try:
         r = subprocess.run(
             [ff, "-i", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=25,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20,
         )
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", r.stderr or "")
         if m:
@@ -175,10 +176,14 @@ def probe_duration(path: str, ff: str) -> float:
     return 10.0
 
 
-def run_ff(cmd, timeout=1200):
-    return subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, text=True
-    )
+def run_ff(cmd, timeout=900):
+    try:
+        return subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, text=True
+        )
+    except subprocess.TimeoutExpired:
+        print("ffmpeg timeout", flush=True)
+        return None
 
 
 def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = False) -> bool:
@@ -186,18 +191,18 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
     if not ff:
         print("ERROR: ffmpeg not found", flush=True)
         return False
+
     if not os.path.exists(bg_path_in) or not os.path.exists(main_path):
-        print("missing input files", flush=True)
+        print("missing files", flush=True)
         return False
 
     raw = probe_duration(main_path, ff)
     duration = min(max(raw, 0.5), MAX_DURATION)
     print(f"compose raw={raw:.1f}s use={duration:.1f}s circle={circle}", flush=True)
 
-    # quality settings
     if duration <= 12:
         crf = 18
-    elif duration <= 30:
+    elif duration <= 25:
         crf = 22
     else:
         crf = 25
@@ -207,7 +212,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
     main_prep = f"tmp_main_{uid}.mp4"
     out_tmp = f"tmp_out_{uid}.mp4"
     W, H = 1080, 1920
-    border = 16
+    border = 14
 
     if circle:
         inner = 680
@@ -220,11 +225,11 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
     try:
         bg_ext = os.path.splitext(bg_path_in)[1].lower()
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
-        tlim = max(400, int(duration * 12) + 180)
+        tlim = max(300, int(duration * 10) + 150)
 
-        # ========== 1. BACKGROUND ==========
+        # ---- 1. Background ----
         if is_image:
-            cmd_bg = [
+            cmd = [
                 ff, "-y", "-loop", "1", "-i", bg_path_in,
                 "-t", f"{duration:.2f}",
                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
@@ -232,7 +237,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
                 "-pix_fmt", "yuv420p", "-an", bg_mp4,
             ]
         else:
-            cmd_bg = [
+            cmd = [
                 ff, "-y", "-stream_loop", "-1", "-i", bg_path_in,
                 "-t", f"{duration:.2f}",
                 "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps=30,format=yuv420p",
@@ -240,22 +245,22 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
                 "-pix_fmt", "yuv420p", "-an", bg_mp4,
             ]
 
-        r = run_ff(cmd_bg, timeout=tlim)
-        if r.returncode != 0 or not os.path.exists(bg_mp4) or os.path.getsize(bg_mp4) < 2000:
-            print("BG FAIL:", (r.stderr or "")[-800:], flush=True)
+        r = run_ff(cmd, timeout=tlim)
+        if not r or r.returncode != 0 or not os.path.exists(bg_mp4) or os.path.getsize(bg_mp4) < 2000:
+            print("BG FAIL:", (r.stderr if r else "")[-600:], flush=True)
             return False
         print("bg ok", flush=True)
 
-        # ========== 2. MAIN + WHITE BORDER ==========
+        # ---- 2. Main + white border ----
         if circle:
-            vf_main = (
+            vf = (
                 f"scale={inner}:{inner}:force_original_aspect_ratio=increase,"
                 f"crop={inner}:{inner},"
                 f"pad={mw}:{mh}:{border}:{border}:color=white,"
                 f"setsar=1,fps=30,format=yuv420p"
             )
         else:
-            vf_main = (
+            vf = (
                 f"scale={inner_w}:{inner_h}:force_original_aspect_ratio=decrease,"
                 f"pad={inner_w}:{inner_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
                 f"pad={mw}:{mh}:{border}:{border}:color=white,"
@@ -265,18 +270,17 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         r = run_ff([
             ff, "-y", "-i", main_path,
             "-t", f"{duration:.2f}",
-            "-vf", vf_main,
+            "-vf", vf,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(crf),
             "-pix_fmt", "yuv420p", "-an", main_prep,
         ], timeout=tlim)
 
-        if r.returncode != 0 or not os.path.exists(main_prep) or os.path.getsize(main_prep) < 2000:
-            print("MAIN FAIL:", (r.stderr or "")[-800:], flush=True)
+        if not r or r.returncode != 0 or not os.path.exists(main_prep) or os.path.getsize(main_prep) < 2000:
+            print("MAIN FAIL:", (r.stderr if r else "")[-600:], flush=True)
             return False
         print("main ok", flush=True)
 
-        # ========== 3. SIMPLE OVERLAY (video only first) ==========
-        # This is the most reliable way on limited Railway ffmpeg
+        # ---- 3. Overlay (video only) ----
         r = run_ff([
             ff, "-y",
             "-i", bg_mp4,
@@ -289,16 +293,16 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             out_tmp,
-        ], timeout=max(500, int(duration * 15)))
+        ], timeout=max(400, int(duration * 12)))
 
-        if r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-            print("OVERLAY FAIL:", (r.stderr or "")[-800:], flush=True)
+        if not r or r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
+            print("OVERLAY FAIL:", (r.stderr if r else "")[-600:], flush=True)
             return False
         print("overlay ok", flush=True)
 
-        # ========== 4. ADD AUDIO (optional second pass) ==========
+        # ---- 4. Try add audio ----
         final = f"tmp_final_{uid}.mp4"
-        r_audio = run_ff([
+        r2 = run_ff([
             ff, "-y",
             "-i", out_tmp,
             "-i", main_path,
@@ -309,20 +313,19 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             "-shortest",
             "-movflags", "+faststart",
             final,
-        ], timeout=max(300, int(duration * 8)))
+        ], timeout=max(200, int(duration * 6)))
 
-        if r_audio.returncode == 0 and os.path.exists(final) and os.path.getsize(final) > 3000:
+        if r2 and r2.returncode == 0 and os.path.exists(final) and os.path.getsize(final) > 3000:
             cleanup(out_tmp)
             out_tmp = final
             print("audio added", flush=True)
         else:
-            print("audio skip (using video only)", flush=True)
-            # keep out_tmp as is (no audio)
+            print("audio skipped", flush=True)
 
-        # ========== 5. FINAL COMPRESS IF NEEDED ==========
+        # ---- 5. Compress if big ----
         size = os.path.getsize(out_tmp)
-        if size > 40 * 1024 * 1024 or duration > 25:
-            print(f"compressing {size // (1024*1024)} MB ...", flush=True)
+        if size > 38 * 1024 * 1024 or duration > 20:
+            print(f"compressing {size//(1024*1024)}MB", flush=True)
             comp = f"tmp_comp_{uid}.mp4"
             r3 = run_ff([
                 ff, "-y", "-i", out_tmp,
@@ -331,19 +334,15 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
                 "-movflags", "+faststart",
                 "-pix_fmt", "yuv420p",
                 comp,
-            ], timeout=max(300, int(duration * 10)))
-            if r3.returncode == 0 and os.path.exists(comp) and os.path.getsize(comp) > 3000:
+            ], timeout=max(250, int(duration * 8)))
+            if r3 and r3.returncode == 0 and os.path.exists(comp) and os.path.getsize(comp) > 3000:
                 cleanup(out_tmp)
                 out_tmp = comp
-                print("compressed", flush=True)
 
         shutil.move(out_tmp, output_path)
         print(f"SUCCESS {os.path.getsize(output_path)} bytes", flush=True)
         return True
 
-    except subprocess.TimeoutExpired:
-        print("TIMEOUT", flush=True)
-        return False
     except Exception as e:
         print(f"compose error: {e}", flush=True)
         return False
@@ -360,8 +359,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Send image / GIF / short video → background\n"
         "2. Send any video → overlay + white border\n"
         "3. Circle Mode / Reset Background\n\n"
-        "Supports up to 60 seconds.\n"
-        "Long clips are auto-compressed.\n"
+        "Up to 60 seconds supported.\n"
+        "Long clips auto-compressed.\n"
         "DM only.",
         reply_markup=kb(),
     )
@@ -376,8 +375,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "How to use\n\n"
         f"Status: {status}\n"
         f"Shape: {mode}\n\n"
-        "Send media for background, then a video to overlay.\n"
-        "Max 60 seconds supported.",
+        "Send media for background, then a video to overlay.",
         reply_markup=kb(),
     )
 
@@ -466,10 +464,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             size = getattr(file_obj, "file_size", None) or 0
             if size > 50 * 1024 * 1024:
-                await status.edit_text(
-                    "File too large (50+ MB).\n"
-                    "Telegram bot limit is ~20 MB. Compress and retry."
-                )
+                await status.edit_text("File too large. Compress under 20 MB.")
                 return
 
             input_path = f"in_{stamp}{ext}"
@@ -478,13 +473,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await tg.download_to_drive(input_path)
             except Exception as e:
                 es = str(e).lower()
-                if "too big" in es or "too large" in es or "20" in es:
-                    await status.edit_text(
-                        "Telegram rejected download (~20 MB max).\n"
-                        "Compress the file and send again."
-                    )
+                if "too big" in es or "too large" in es:
+                    await status.edit_text("Telegram limit ~20 MB. Compress and retry.")
                 else:
-                    await status.edit_text(f"Download failed: {str(e)[:120]}")
+                    await status.edit_text(f"Download failed: {str(e)[:100]}")
                 return
 
             bg = get_bg(uid)
@@ -493,9 +485,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_bg(uid, input_path)
                 await status.edit_text(
                     "Background saved.\n\n"
-                    "Now send any video to overlay.\n"
-                    "Circle Mode toggles shape.\n"
-                    "Reset Background clears it."
+                    "Now send a video to overlay.\n"
+                    "Circle Mode / Reset Background available."
                 )
                 return
 
@@ -507,26 +498,20 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             if not ok or not os.path.exists(output_path):
-                await status.edit_text("Overlay failed. Check Railway logs.")
+                await status.edit_text("Overlay failed. Check logs.")
                 return
 
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             with open(output_path, "rb") as f:
                 if size_mb > 48:
                     await message.reply_document(
-                        document=f,
-                        caption="Done",
-                        filename="overlay.mp4",
-                        read_timeout=300,
-                        write_timeout=300,
+                        document=f, caption="Done", filename="overlay.mp4",
+                        read_timeout=300, write_timeout=300,
                     )
                 else:
                     await message.reply_video(
-                        video=f,
-                        caption="Done",
-                        supports_streaming=True,
-                        read_timeout=300,
-                        write_timeout=300,
+                        video=f, caption="Done", supports_streaming=True,
+                        read_timeout=300, write_timeout=300,
                     )
             try:
                 await status.delete()
@@ -536,15 +521,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"handle_media: {e}", flush=True)
             try:
-                await status.edit_text(f"Failed: {str(e)[:150]}")
+                await status.edit_text(f"Failed: {str(e)[:120]}")
             except Exception:
                 pass
         finally:
             cleanup(input_path, output_path)
             for f in os.listdir("."):
-                if stamp in f and (
-                    f.startswith("tmp_") or f.startswith("in_") or f.startswith("out_")
-                ):
+                if stamp in f and (f.startswith("tmp_") or f.startswith("in_") or f.startswith("out_")):
                     cleanup(f)
 
 
@@ -553,7 +536,7 @@ def main():
 
     ff = get_ffmpeg()
     if not ff:
-        print("WARNING: ffmpeg missing — add imageio-ffmpeg to requirements.txt", flush=True)
+        print("WARNING: ffmpeg missing", flush=True)
     else:
         print(f"Using ffmpeg: {ff}", flush=True)
 
@@ -579,9 +562,12 @@ def main():
     while True:
         try:
             app.run_polling(drop_pending_updates=True, close_loop=False)
+        except Conflict:
+            print("Conflict: another bot instance running. Waiting 15s...", flush=True)
+            time.sleep(15)
         except Exception as e:
-            print(f"polling died: {e}", flush=True)
-            time.sleep(5)
+            print(f"polling error: {e}", flush=True)
+            time.sleep(8)
 
 
 if __name__ == "__main__":
