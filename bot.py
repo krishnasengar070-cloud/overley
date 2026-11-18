@@ -199,7 +199,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         is_image = bg_ext in [".png", ".jpg", ".jpeg", ".webp"]
         tlim = max(200, int(duration * 6) + 90)
 
-        # background
+        # ---------- background ----------
         if is_image:
             cmd_bg = [
                 ff, "-y", "-loop", "1", "-i", bg_path_in,
@@ -221,7 +221,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             print("bg fail:", (r.stderr or "")[-600:], flush=True)
             return False
 
-        # main scaled
+        # ---------- main panel ----------
         if circle:
             vf_main = (
                 f"scale={mw}:{mh}:force_original_aspect_ratio=increase,"
@@ -244,16 +244,21 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             print("main fail:", (r.stderr or "")[-600:], flush=True)
             return False
 
-        # soft white glow + thin bright edge (working version)
-        pad = 40
+        # ---------- final composite (robust white glow) ----------
+        # 1. soft outer glow
+        # 2. thin bright white edge
+        # 3. main video on top
+        # No shortest=1, pure -t control
+        pad = 48
         fc = (
             f"[1:v]pad=iw+{pad*2}:ih+{pad*2}:{pad}:{pad}:color=white,"
-            f"boxblur=22:8[glow];"
-            f"[1:v]pad=iw+10:ih+10:5:5:color=white[edge];"
-            f"[0:v][glow]overlay=(W-w)/2:(H-h)/2[a];"
-            f"[a][edge]overlay=(W-w)/2:(H-h)/2[b];"
-            f"[b][1:v]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
+            f"boxblur=24:8[glow];"
+            f"[1:v]pad=iw+12:ih+12:6:6:color=white[edge];"
+            f"[0:v][glow]overlay=(W-w)/2:(H-h)/2[tmp1];"
+            f"[tmp1][edge]overlay=(W-w)/2:(H-h)/2[tmp2];"
+            f"[tmp2][1:v]overlay=(W-w)/2:(H-h)/2[v]"
         )
+
         r = run_ff([
             ff, "-y",
             "-i", bg_mp4,
@@ -271,27 +276,34 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
         ], timeout=max(240, int(duration * 7)))
 
         if r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-            print("glow fail, simple border:", (r.stderr or "")[-500:], flush=True)
+            print("glow fail → simple white border:", (r.stderr or "")[-500:], flush=True)
+
+            # ultra simple fallback – only white pad, almost never fails
             fc2 = (
-                f"[1:v]pad={mw+16}:{mh+16}:8:8:color=white[m];"
-                f"[0:v][m]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
+                f"[1:v]pad={mw+20}:{mh+20}:10:10:color=white[m];"
+                f"[0:v][m]overlay=(W-w)/2:(H-h)/2[v]"
             )
             r2 = run_ff([
                 ff, "-y",
-                "-i", bg_mp4, "-i", main_prep, "-i", main_path,
+                "-i", bg_mp4,
+                "-i", main_prep,
+                "-i", main_path,
                 "-filter_complex", fc2,
-                "-map", "[v]", "-map", "2:a?",
+                "-map", "[v]",
+                "-map", "2:a?",
                 "-t", f"{duration:.2f}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
                 "-c:a", "aac", "-b:a", "128k",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 out_tmp,
             ], timeout=max(180, int(duration * 5)))
+
             if r2.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
-                print("fallback fail:", (r2.stderr or "")[-400:], flush=True)
+                print("fallback fail:", (r2.stderr or "")[-500:], flush=True)
                 return False
 
-        # auto compress if too big for Telegram
+        # auto compress if too big
         size = os.path.getsize(out_tmp)
         if size > 45 * 1024 * 1024:
             print(f"compressing {size // (1024*1024)}MB ...", flush=True)
@@ -306,8 +318,6 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             if r3.returncode == 0 and os.path.exists(comp) and os.path.getsize(comp) > 3000:
                 cleanup(out_tmp)
                 out_tmp = comp
-            else:
-                print("compress fail, sending original", flush=True)
 
         shutil.move(out_tmp, output_path)
         print(f"OK {os.path.getsize(output_path)} bytes", flush=True)
@@ -334,9 +344,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Circle Mode → square frame mode\n"
         "4. Reset Background → clear\n\n"
         "Output: 1080x1920\n"
-        "DM only. Videos up to ~20 MB (Telegram limit).\n"
-        "Bot auto-compresses if output is large.\n\n"
-        "Tip: Save result to device to see real quality.",
+        "DM only. Bot auto-compresses large files.\n\n"
+        "Tip: Save result to device for real quality.",
         reply_markup=kb(),
     )
 
@@ -350,8 +359,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "How to use\n\n"
         f"Status: {status}\n"
         f"Shape: {mode}\n\n"
-        "Send media for background, then a video to overlay.\n"
-        "Save output to device for real quality.",
+        "Send media for background, then a video to overlay.",
         reply_markup=kb(),
     )
 
