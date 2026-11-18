@@ -17,7 +17,7 @@ except ImportError:
     imageio_ffmpeg = None
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+    from PIL import Image
 except ImportError:
     Image = None
 
@@ -31,8 +31,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 user_bg = {}
 user_circle = {}
-user_wm = {}
-user_await_wm = {}
 user_locks = {}
 
 MAX_DURATION = 45.0
@@ -88,7 +86,7 @@ def kb():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("Reset Background"), KeyboardButton("Circle Mode")],
-            [KeyboardButton("Watermark"), KeyboardButton("Help")],
+            [KeyboardButton("Help")],
         ],
         resize_keyboard=True,
     )
@@ -96,10 +94,6 @@ def kb():
 
 def bg_path(uid: int, ext: str) -> str:
     return os.path.join(DATA_DIR, f"bg_{uid}{ext}")
-
-
-def wm_path(uid: int) -> str:
-    return os.path.join(DATA_DIR, f"wm_{uid}.png")
 
 
 def get_bg(uid: int):
@@ -130,23 +124,6 @@ def save_bg(uid: int, src: str) -> str:
     shutil.copy(src, dest)
     user_bg[uid] = dest
     return dest
-
-
-def get_wm(uid: int):
-    p = wm_path(uid)
-    if os.path.exists(p) and os.path.getsize(p) > 50:
-        return p
-    return None
-
-
-def clear_wm(uid: int):
-    p = wm_path(uid)
-    if os.path.exists(p):
-        try:
-            os.remove(p)
-        except Exception:
-            pass
-    user_wm.pop(uid, None)
 
 
 def is_circle(uid: int) -> bool:
@@ -202,48 +179,7 @@ def run_ff(cmd, timeout=900):
     )
 
 
-def make_watermark_png(src: str, out_png: str) -> bool:
-    """Make transparent watermark PNG with soft shadow (pvnuo style)."""
-    if Image is None:
-        return False
-    try:
-        img = Image.open(src).convert("RGBA")
-        # max width for watermark
-        max_w = 420
-        if img.width > max_w:
-            ratio = max_w / img.width
-            img = img.resize((max_w, max(1, int(img.height * ratio))), Image.Resampling.LANCZOS)
-
-        # if mostly opaque photo, try to keep as-is with alpha
-        # boost contrast a bit for logo look
-        r, g, b, a = img.split()
-        rgb = Image.merge("RGB", (r, g, b))
-        rgb = ImageEnhance.Contrast(rgb).enhance(1.15)
-        rgb = ImageEnhance.Brightness(rgb).enhance(1.05)
-        r, g, b = rgb.split()
-
-        # soft outer shadow
-        shadow = Image.new("RGBA", (img.width + 24, img.height + 24), (0, 0, 0, 0))
-        # alpha as mask for shadow
-        mask = a.point(lambda x: 200 if x > 20 else 0)
-        sh = Image.new("RGBA", img.size, (0, 0, 0, 160))
-        shadow.paste(sh, (14, 14), mask)
-        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=6))
-
-        # paste main on top, slightly transparent
-        main_a = a.point(lambda x: int(x * 0.88) if x > 10 else 0)
-        main = Image.merge("RGBA", (r, g, b, main_a))
-        canvas = Image.new("RGBA", shadow.size, (0, 0, 0, 0))
-        canvas = Image.alpha_composite(canvas, shadow)
-        canvas.paste(main, (8, 8), main)
-        canvas.save(out_png, "PNG")
-        return os.path.exists(out_png) and os.path.getsize(out_png) > 50
-    except Exception as e:
-        print(f"wm make error: {e}", flush=True)
-        return False
-
-
-def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = False, wm: str = None) -> bool:
+def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = False) -> bool:
     ff = get_ffmpeg()
     if not ff:
         print("ERROR: ffmpeg not found", flush=True)
@@ -253,7 +189,7 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
 
     raw_dur = probe_duration(main_path, ff)
     duration = min(max(raw_dur, 0.5), MAX_DURATION)
-    print(f"compose d={duration:.1f}s (raw={raw_dur:.1f}) circle={circle} wm={bool(wm)}", flush=True)
+    print(f"compose d={duration:.1f}s (raw={raw_dur:.1f}) circle={circle}", flush=True)
 
     uid = str(int(time.time() * 1000))
     bg_mp4 = f"tmp_bg_{uid}.mp4"
@@ -316,43 +252,22 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
             print("main fail:", (r.stderr or "")[-500:], flush=True)
             return False
 
-        # stronger soft lightning glow (dual blur layers)
-        pad = 56
-        has_wm = bool(wm and os.path.exists(wm))
-
-        # animated watermark: gentle horizontal sway + slight vertical bob at bottom center
-        # x = (W-w)/2 + 18*sin(2*PI*t/3)
-        # y = H - h - 70 + 10*sin(2*PI*t/2.2)
-        if has_wm:
-            fc = (
-                f"[1:v]pad=iw+{pad*2}:ih+{pad*2}:{pad}:{pad}:color=white,"
-                f"boxblur=30:12[glow_soft];"
-                f"[1:v]pad=iw+{pad}:ih+{pad}:{pad//2}:{pad//2}:color=white,"
-                f"boxblur=12:5[glow_mid];"
-                f"[1:v]pad=iw+12:ih+12:6:6:color=white[edge];"
-                f"[0:v][glow_soft]overlay=(W-w)/2:(H-h)/2[a];"
-                f"[a][glow_mid]overlay=(W-w)/2:(H-h)/2[b];"
-                f"[b][edge]overlay=(W-w)/2:(H-h)/2[c];"
-                f"[c][1:v]overlay=(W-w)/2:(H-h)/2:shortest=1[base];"
-                f"[2:v]format=rgba,colorchannelmixer=aa=0.82[wm];"
-                f"[base][wm]overlay=x='(W-w)/2+18*sin(2*PI*t/3)':y='H-h-70+10*sin(2*PI*t/2.2)':shortest=1[v]"
-            )
-            inputs = ["-i", bg_mp4, "-i", main_prep, "-i", wm, "-i", main_path]
-            map_a = "3:a?"
-        else:
-            fc = (
-                f"[1:v]pad=iw+{pad*2}:ih+{pad*2}:{pad}:{pad}:color=white,"
-                f"boxblur=30:12[glow_soft];"
-                f"[1:v]pad=iw+{pad}:ih+{pad}:{pad//2}:{pad//2}:color=white,"
-                f"boxblur=12:5[glow_mid];"
-                f"[1:v]pad=iw+12:ih+12:6:6:color=white[edge];"
-                f"[0:v][glow_soft]overlay=(W-w)/2:(H-h)/2[a];"
-                f"[a][glow_mid]overlay=(W-w)/2:(H-h)/2[b];"
-                f"[b][edge]overlay=(W-w)/2:(H-h)/2[c];"
-                f"[c][1:v]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-            )
-            inputs = ["-i", bg_mp4, "-i", main_prep, "-i", main_path]
-            map_a = "2:a?"
+        # white lightning border (soft bright rim matching sample)
+        # outer soft glow + mid glow + hard white edge
+        pad = 48
+        fc = (
+            f"[1:v]pad=iw+{pad*2}:ih+{pad*2}:{pad}:{pad}:color=white,"
+            f"boxblur=28:10[glow_soft];"
+            f"[1:v]pad=iw+{pad}:ih+{pad}:{pad//2}:{pad//2}:color=white,"
+            f"boxblur=10:4[glow_mid];"
+            f"[1:v]pad=iw+14:ih+14:7:7:color=white[edge];"
+            f"[0:v][glow_soft]overlay=(W-w)/2:(H-h)/2[a];"
+            f"[a][glow_mid]overlay=(W-w)/2:(H-h)/2[b];"
+            f"[b][edge]overlay=(W-w)/2:(H-h)/2[c];"
+            f"[c][1:v]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
+        )
+        inputs = ["-i", bg_mp4, "-i", main_prep, "-i", main_path]
+        map_a = "2:a?"
 
         r = run_ff([
             ff, "-y",
@@ -370,22 +285,12 @@ def compose(bg_path_in: str, main_path: str, output_path: str, circle: bool = Fa
 
         if r.returncode != 0 or not os.path.exists(out_tmp) or os.path.getsize(out_tmp) < 3000:
             print("glow fail, simple:", (r.stderr or "")[-500:], flush=True)
-            if has_wm:
-                fc2 = (
-                    f"[1:v]pad={mw+16}:{mh+16}:8:8:color=white[m];"
-                    f"[0:v][m]overlay=(W-w)/2:(H-h)/2[base];"
-                    f"[2:v]format=rgba,colorchannelmixer=aa=0.82[wm];"
-                    f"[base][wm]overlay=(W-w)/2:H-h-70:shortest=1[v]"
-                )
-                inputs2 = ["-i", bg_mp4, "-i", main_prep, "-i", wm, "-i", main_path]
-                map_a2 = "3:a?"
-            else:
-                fc2 = (
-                    f"[1:v]pad={mw+16}:{mh+16}:8:8:color=white[m];"
-                    f"[0:v][m]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
-                )
-                inputs2 = ["-i", bg_mp4, "-i", main_prep, "-i", main_path]
-                map_a2 = "2:a?"
+            fc2 = (
+                f"[1:v]pad={mw+18}:{mh+18}:9:9:color=white[m];"
+                f"[0:v][m]overlay=(W-w)/2:(H-h)/2:shortest=1[v]"
+            )
+            inputs2 = ["-i", bg_mp4, "-i", main_prep, "-i", main_path]
+            map_a2 = "2:a?"
             r2 = run_ff([
                 ff, "-y",
                 *inputs2,
@@ -437,9 +342,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Overlay Bot\n\n"
         "1. Send image / GIF / short video → background\n"
-        "2. Send any video → overlay + lightning glow\n"
-        "3. Watermark → send logo image after pressing button\n"
-        "4. Circle Mode / Reset Background\n\n"
+        "2. Send any video → overlay + white lightning border\n"
+        "3. Circle Mode / Reset Background\n\n"
         "Output 1080x1920. Up to ~40s videos.\n"
         "DM only. File size limit ~20 MB (Telegram).\n\n"
         "Tip: Save result to device for real quality.",
@@ -450,17 +354,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     bg = get_bg(uid)
-    wm = get_wm(uid)
     mode = "Circle" if is_circle(uid) else "Rectangle"
     await update.message.reply_text(
         "How to use\n\n"
         f"Background: {'set' if bg else 'not set'}\n"
-        f"Watermark: {'set' if wm else 'not set'}\n"
         f"Shape: {mode}\n\n"
         "• Media → background (if none) or overlay\n"
-        "• Watermark button → then send logo image\n"
-        "• Logo becomes transparent animated mark at bottom\n"
-        "• Videos up to ~40 seconds supported",
+        "• Videos up to ~40 seconds supported\n"
+        "• White lightning rim around the main panel",
         reply_markup=kb(),
     )
 
@@ -472,7 +373,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     uid = update.effective_user.id
-    low = text.lower()
 
     if text == "Reset Background":
         clear_bg(uid)
@@ -491,24 +391,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == "Watermark" or low == "watermark":
-        user_await_wm[uid] = True
-        await update.message.reply_text(
-            "Watermark mode ON.\n\n"
-            "Now send your logo / text image (@pvnuo style).\n"
-            "It will be transparent + slightly animated at the bottom.\n\n"
-            "Send another Watermark message after setting to clear it.",
-            reply_markup=kb(),
-        )
-        return
-
     if text == "Help":
         await help_cmd(update, context)
         return
 
     await update.message.reply_text(
-        "Send image/GIF/video for background, or a video to overlay.\n"
-        "Press Watermark then send logo image.",
+        "Send image/GIF/video for background, or a video to overlay.",
         reply_markup=kb(),
     )
 
@@ -583,65 +471,21 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await status.edit_text(f"Download failed: {str(e)[:120]}")
                 return
 
-            # watermark set flow
-            if user_await_wm.get(uid) and prefer_bg:
-                user_await_wm[uid] = False
-                dest = wm_path(uid)
-                ok = make_watermark_png(input_path, dest)
-                if not ok:
-                    # fallback: just copy as png-ish
-                    try:
-                        if Image:
-                            Image.open(input_path).convert("RGBA").save(dest, "PNG")
-                            ok = True
-                    except Exception:
-                        ok = False
-                if ok:
-                    user_wm[uid] = dest
-                    await status.edit_text(
-                        "Watermark saved.\n"
-                        "It will appear transparent + animated at the bottom of overlays.\n"
-                        "Press Watermark again anytime to replace / set new."
-                    )
-                else:
-                    await status.edit_text("Could not process watermark image. Try PNG/JPG logo.")
-                return
-
-            # if caption is watermark
-            cap = (message.caption or "").strip().lower()
-            if prefer_bg and cap == "watermark":
-                dest = wm_path(uid)
-                ok = make_watermark_png(input_path, dest)
-                if not ok and Image:
-                    try:
-                        Image.open(input_path).convert("RGBA").save(dest, "PNG")
-                        ok = True
-                    except Exception:
-                        ok = False
-                if ok:
-                    user_wm[uid] = dest
-                    await status.edit_text("Watermark saved (from caption).")
-                else:
-                    await status.edit_text("Watermark failed.")
-                return
-
             bg = get_bg(uid)
 
             if prefer_bg or bg is None:
                 save_bg(uid, input_path)
                 await status.edit_text(
                     "Background saved.\n\n"
-                    "Send a video to overlay with lightning glow.\n"
-                    "Watermark button → set logo.\n"
+                    "Send a video to overlay with white lightning border.\n"
                     "Circle Mode / Reset Background available."
                 )
                 return
 
             output_path = f"out_{stamp}.mp4"
             circle = is_circle(uid)
-            wm = get_wm(uid)
             ok = await asyncio.get_event_loop().run_in_executor(
-                None, compose, bg, input_path, output_path, circle, wm
+                None, compose, bg, input_path, output_path, circle
             )
             if not ok or not os.path.exists(output_path):
                 await status.edit_text(
