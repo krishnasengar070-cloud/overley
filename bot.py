@@ -5,7 +5,7 @@ import subprocess
 import asyncio
 import re
 from threading import Thread
-from flask import Flask
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -41,22 +41,32 @@ def get_ffmpeg() -> str:
     return ""
 
 
-# ---------- Railway keep-alive (same idea as dupe bot) ----------
-app_flask = Flask(__name__)
+# ---------- Railway keep-alive (stdlib only, no flask needed) ----------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"Overlay bot is alive!"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-
-@app_flask.route("/")
-def home():
-    return "Overlay bot is alive!"
-
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host="0.0.0.0", port=port)
+    def log_message(self, format, *args):
+        return
 
 
 def keep_alive():
-    t = Thread(target=run_flask, daemon=True)
+    port = int(os.environ.get("PORT", 8080))
+
+    def _run():
+        try:
+            server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+            print(f"Health server on port {port}", flush=True)
+            server.serve_forever()
+        except Exception as e:
+            print(f"Health server error: {e}", flush=True)
+
+    t = Thread(target=_run, daemon=True)
     t.start()
 
 
