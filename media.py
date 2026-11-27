@@ -1,4 +1,6 @@
 """Render a translucent glass rim over the original video."""
+import io
+import logging
 import json
 import math
 import subprocess
@@ -22,12 +24,12 @@ def run(args):
     except subprocess.TimeoutExpired as exc:
         raise MediaError("This video took too long to process.") from exc
     except subprocess.CalledProcessError as exc:
-        raise MediaError("This video could not be decoded or exported.") from exc
+        logging.warning("%s failed: %s", args[0], exc.stderr.decode(errors="replace")[-1600:])
+        raise MediaError("The media export failed. Try an H.264 MP4 or a transparent PNG logo.") from exc
 
 
 # Fractions of the shorter video side, so the same style works at any resolution.
-LOGO_WIDTH_FRACTION = 0.65
-LOGO_CENTER_Y = 0.11
+LOGO_CENTER_Y = 0.12
 GLASS_WIDTH = 0.018
 GAP_RATIO = 0.0135
 
@@ -100,7 +102,7 @@ def supports_nvenc():
     return probe.returncode == 0
 
 
-LOGO_FORMATS = "png_pipe,jpeg_pipe,gif,mov"
+LOGO_FORMATS = "png_pipe,jpeg_pipe,mjpeg,gif,mov,webp_pipe,matroska,webm"
 
 
 def inspect_logo(path):
@@ -111,7 +113,7 @@ def inspect_logo(path):
                    and not s.get("disposition", {}).get("attached_pic")), None)
     if not stream or stream["width"] * stream["height"] > 4096 * 2160:
         raise MediaError("Send a PNG, JPEG, GIF or MP4 logo up to 4K.")
-    return stream, info["format"]["format_name"] in {"png_pipe", "jpeg_pipe"}
+    return stream, info["format"]["format_name"] in {"png_pipe", "jpeg_pipe", "mjpeg", "webp_pipe"}
 
 
 def logo_filters(path, index):
@@ -120,9 +122,9 @@ def logo_filters(path, index):
     from PIL import ImageFilter
     side = 96
     args = ["ffmpeg", "-v", "error", "-protocol_whitelist", "file", "-format_whitelist",
-            LOGO_FORMATS, "-i", str(path), "-map", f"0:{index}", "-vf",
+            LOGO_FORMATS, "-threads", "2", "-filter_threads", "1", "-i", str(path), "-map", f"0:{index}", "-vf",
             "select='isnan(prev_selected_t)+gte(t-prev_selected_t,0.125)',scale=96:96",
-            "-fps_mode", "vfr", "-frames:v", "960", "-pix_fmt", "rgba", "-f", "rawvideo", "-"]
+            "-fps_mode", "vfr", "-frames:v", "960", "-pix_fmt", "rgba", "-threads", "1", "-f", "rawvideo", "-"]
     raw = run(args)
     stride = side * side * 4
     if not raw:
@@ -133,14 +135,18 @@ def logo_filters(path, index):
     for frame in frames[::max(1, len(frames)//12)]:
         for n in range(2, side-2, 8):
             edges.extend(frame.getpixel(xy) for xy in [(n,1),(n,side-2),(1,n),(side-2,n)])
-    greens = [(r,g,b) for r,g,b,a in edges if a > 240 and g > max(r,b)+45]
+    # Use the majority colour along the perimeter. A lower majority threshold
+    # also handles a solid screen occupying only one section of a clip.
+    opaque = [pixel[:3] for pixel in edges if pixel[3] > 240]
     key = None
     prefix = ""
-    if len(greens) > len(edges)*0.70:
-        color = tuple(round(median(channel)) for channel in zip(*greens))
-        if sum(max(abs(v-c) for v,c in zip(pixel,color)) < 25 for pixel in greens) > len(edges)*0.65:
-            key = color
-            prefix = "colorkey=0x%02x%02x%02x:0.12:0.035," % key
+    if len(opaque) > 0.97 * len(edges) and all(frame.getchannel("A").getextrema()[0] == 255 for frame in frames):
+        candidate = tuple(round(median(channel)) for channel in zip(*opaque))
+        matching = sum(max(abs(a-b) for a,b in zip(rgb,candidate)) <= 20 for rgb in opaque)
+        if matching >= 0.52 * len(opaque):
+            key = candidate
+            tolerance = 0.11 if key[1] > max(key[0],key[2])+45 else 0.035
+            prefix = ("colorkey=0x%02x%02x%02x:" % key) + f"{tolerance}:0.015,"
     union = Image.new("L", (side, side))
     for frame in frames:
         mask = frame.getchannel("A").point(lambda a: 255 if a > 32 else 0)
@@ -151,16 +157,18 @@ def logo_filters(path, index):
             mask = ImageChops.multiply(mask, solid)
         union = ImageChops.lighter(union, mask)
     box = union.filter(ImageFilter.MaxFilter(5)).getbbox()
-    if box and box != (0,0,side,side) and len(frames) < 960:
+    if not box:
+        return "", 1, 1
+    if box != (0,0,side,side) and len(frames) < 960:
         l,t,r,b = box
         prefix += f"crop=ceil(iw*{r-l}/96):ceil(ih*{b-t}/96):floor(iw*{l}/96):floor(ih*{t}/96),"
         return prefix, (r-l)/side, (b-t)/side
     return prefix, 1, 1
 
 
-def prepare_logo(path):
+def prepare_logo(path, remove_bg=True):
     stream, still = inspect_logo(path)
-    prefix, x_fraction, y_fraction = logo_filters(path, stream["index"])
+    prefix, x_fraction, y_fraction = logo_filters(path, stream["index"]) if remove_bg else ("", 1, 1)
     w, h = stream["width"], stream["height"]
     rotation = next((x["rotation"] for x in stream.get("side_data_list", [])
                      if "rotation" in x), 0)
@@ -169,7 +177,56 @@ def prepare_logo(path):
     return stream["index"], still, prefix, math.ceil(w*x_fraction), math.ceil(h*y_fraction)
 
 
-def render(source: Path, output: Path, background: Path | None = None, logo: Path | None = None, logo_details=None):
+def logo_layout(width, height, size, x, y):
+    """Use the same fit and edge clamps in the editor and the video."""
+    width_limit = max(1, round(width * size / 100))
+    height_limit = max(1, round(height * size / 100))
+    fit = (f"scale={width_limit}:{height_limit}:force_original_aspect_ratio=decrease:"
+           "flags=lanczos,")
+    return fit, f"clip({x}/100*W-w/2,0,W-w)", f"clip({y}/100*H-h/2,0,H-h)"
+
+
+def preview_mark(path, remove_bg):
+    index, still, prep, mw, mh = prepare_logo(path, remove_bg)
+    # Sample several points so an animation starting transparent has a visible poster.
+    args = ["ffmpeg", "-v", "error", "-protocol_whitelist", "file", "-format_whitelist",
+            LOGO_FORMATS, "-threads", "2", "-filter_threads", "1", "-i", str(path),
+            "-map", f"0:{index}", "-vf", "format=rgba," + prep +
+            "select='isnan(prev_selected_t)+gte(t-prev_selected_t,0.5)',"
+            "scale=360:640:force_original_aspect_ratio=decrease,"
+            "format=rgba,pad=360:640:0:0:color=black@0",
+            "-frames:v", "1" if still else "12", "-fps_mode", "vfr",
+            "-threads", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+    raw = run(args)
+    stride = 360 * 640 * 4
+    factor = min(360 / mw, 640 / mh)
+    extent = (0, 0, max(1, round(mw * factor)), max(1, round(mh * factor)))
+    frames = [Image.frombytes("RGBA", (360, 640), raw[i:i+stride]).crop(extent)
+              for i in range(0, len(raw), stride)]
+    if not frames:
+        raise MediaError("The logo has no readable preview frame.")
+    return max(frames, key=lambda im: sum(im.getchannel("A").resize((32, 32)).getdata()))
+
+
+def placement_preview(mark, size, x, y):
+    canvas = Image.new("RGB", (360, 640), "#343940")
+    pen = ImageDraw.Draw(canvas)
+    for xx in range(0, 360, 36):
+        pen.line((xx, 0, xx, 639), fill="#454b55")
+    for yy in range(0, 640, 64):
+        pen.line((0, yy, 359, yy), fill="#454b55")
+    scale = min(360 * size / (100 * mark.width), 640 * size / (100 * mark.height))
+    mark = mark.resize((max(1, round(mark.width * scale)), max(1, round(mark.height * scale))),
+                       Image.Resampling.LANCZOS)
+    left = min(360-mark.width, max(0, round(x*3.6-mark.width/2)))
+    top = min(640-mark.height, max(0, round(y*6.4-mark.height/2)))
+    canvas.paste(mark, (left, top), mark)
+    buf = io.BytesIO()
+    canvas.save(buf, format="JPEG", quality=91)
+    return buf.getvalue()
+
+
+def render(source: Path, output: Path, background: Path | None = None, logo: Path | None = None, logo_details=None, position="top", size=95, x=50, y=None):
     info, video, w, h = inspect_video(source)
     local = ["-protocol_whitelist", "file", "-format_whitelist", FORMATS]
     audio = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
@@ -206,6 +263,15 @@ def render(source: Path, output: Path, background: Path | None = None, logo: Pat
         bw, bh = max(2, bw // 2 * 2), max(2, bh // 2 * 2)
         if bw * bh > 4096 * 2160:
             raise MediaError("The background display resolution exceeds 4K.")
+        scene_fit = f"scale={bw}:{bh},setsar=1"
+        if logo is not None:
+            # Fit a nonportrait template in a 9:16 canvas without stretching.
+            unit = max(1, min(120, round(max(bw, bh) / 32)))
+            cw, ch = 18 * unit, 32 * unit
+            ratio = min(cw / bw, ch / bh)
+            sw, sh = max(2, 2 * round(bw * ratio / 2)), max(2, 2 * round(bh * ratio / 2))
+            scene_fit = f"scale={sw}:{sh},setsar=1,pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2"
+            bw, bh = cw, ch
         # Sample header ends near 19%. Keep a little breathing room below it.
         top = 2 * round(bh * 0.23 / 2)
         box_w = max(2, 2 * int(bw * 0.90 / 2))
@@ -220,11 +286,11 @@ def render(source: Path, output: Path, background: Path | None = None, logo: Pat
         if (rate and rate != "0/0" and rate == video.get("r_frame_rate")
                 and float(video.get("start_time") or 0) == 0):
             graph += (f"[front];[2:{bg['index']}]setpts=PTS-STARTPTS,fps={rate},"
-                      f"scale={bw}:{bh},setsar=1[scene];")
+                      f"{scene_fit}[scene];")
         else:
             # Use the foreground clock to retain variable frame timestamps.
             graph += (f",split[clock][front];[clock]pad={bw}:{bh}:0:0[canvas];"
-                      f"[2:{bg['index']}]scale={bw}:{bh},setsar=1,setpts=PTS-STARTPTS[bg];"
+                      f"[2:{bg['index']}]{scene_fit},setpts=PTS-STARTPTS[bg];"
                       "[canvas][bg]overlay=0:0:shortest=1[scene];")
         graph += f"[scene][front]overlay=(W-w)/2:{top}:shortest=1[composite]"
     video_label = "[composite]" if background is not None else "[v]"
@@ -234,19 +300,16 @@ def render(source: Path, output: Path, background: Path | None = None, logo: Pat
             seconds = float(video.get("duration") or info["format"]["duration"])
             extra_inputs += ["-stream_loop", "-1", "-t", str(seconds + 1)]
         extra_inputs += ["-protocol_whitelist", "file", "-format_whitelist", LOGO_FORMATS,
-                         "-i", str(logo)]
+                         "-threads", "2", "-i", str(logo)]
         eof = "" if still else ":shortest=1"
         overlay_format = ":format=yuv444" if logo_only and (w % 2 or h % 2) else ""
         canvas_w, canvas_h = (w, h) if logo_only else (bw, bh)
-        logo_scale = 1.05 if logo_only else 1.2075
-        max_w = max(2, round(canvas_w * LOGO_WIDTH_FRACTION * logo_scale))
-        max_h = max(2, round(canvas_h * 2 * LOGO_CENTER_Y * logo_scale))
-        fit = (f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease:"
-               "flags=lanczos,")
-        y_position = f"max(0,{LOGO_CENTER_Y}*H-h/2)"
+        if y is None:
+            y = 88 if position == "bottom" else 12
+        fit, x_position, y_position = logo_layout(canvas_w, canvas_h, size, x, y)
         graph += (f";[{input_number}:{index}]format=rgba,{prep}{fit}setsar=1,"
                   f"setpts=PTS-STARTPTS[mark];{video_label}[mark]overlay="
-                  f"(W-w)/2:'{y_position}'{eof}{overlay_format}[branded]")
+                  f"'{x_position}':'{y_position}'{eof}{overlay_format}[branded]")
         video_label = "[branded]"
     base = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_complex_threads", "3",
             *local, "-threads", "2", "-i", str(source), *mask_input,
