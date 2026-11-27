@@ -1,289 +1,6 @@
-"""Render a translucent glass rim over the original video."""
-import json
-import math
-import subprocess
-import os
-from functools import lru_cache
-from pathlib import Path
-
-from PIL import Image, ImageDraw, ImageChops
-
-MAX_OUTPUT = 49_000_000
-FORMATS = "mov,matroska,webm,avi,flv,mpeg,mpegts,asf,ogg"
-
-
-class MediaError(Exception):
-    pass
-
-
-def run(args):
-    try:
-        return subprocess.run(args, check=True, capture_output=True, timeout=900).stdout
-    except subprocess.TimeoutExpired as exc:
-        raise MediaError("This video took too long to process.") from exc
-    except subprocess.CalledProcessError as exc:
-        raise MediaError("This video could not be decoded or exported.") from exc
-
-
-# Fractions of the shorter video side, so the same style works at any resolution.
-LOGO_WIDTH_FRACTION = 0.65
-LOGO_CENTER_Y = 0.11
-GLASS_WIDTH = 0.018
-GAP_RATIO = 0.0135
-
-
-def make_rim(size, rim, inset, radius, target):
-    """Static lighting only. FFmpeg supplies the moving reflection beneath it."""
-    w, h = size
-    layer = Image.new("RGBA", size, (0, 0, 0, 255))
-    pen = ImageDraw.Draw(layer)
-
-    def box(d):
-        return (d, d, w - 1 - d, h - 1 - d)
-
-    for d in range(rim):
-        t = (d + 0.5) / rim
-        outer_light = math.exp(-((t - 0.18) / 0.045) ** 2)
-        inner_light = math.exp(-((t - 0.88) / 0.045) ** 2)
-        shadow = math.exp(-((t - 0.60) / 0.13) ** 2)
-        light = 0.42 * outer_light + 0.51 * inner_light - 0.06 * shadow
-        tone = 255 if light > 0 else 0
-        pen.rounded_rectangle(box(d), radius=max(1, radius-d),
-                              fill=(tone, tone, tone, round(255 * abs(light))))
-    pen.rounded_rectangle(box(rim), radius=max(1, radius-rim), fill="black")
-    pen.rounded_rectangle(box(inset), radius=max(1, radius-inset), fill=(0, 0, 0, 0))
-
-    # Elongated glints on opposite edges give the rounded bevel directional light.
-    sheen = Image.new("L", size)
-    draw = ImageDraw.Draw(sheen)
-    for fraction, edge in [(0.19, 0), (0.77, h - 1)]:
-        for step in range(36, 0, -1):
-            f = step / 36
-            x = round(w * fraction)
-            y = round(rim * 0.22) if edge == 0 else edge - round(rim * 0.22)
-            dx, dy = round(w * 0.12 * f), max(1, round(rim * 0.18 * f))
-            draw.ellipse((x-dx, y-dy, x+dx, y+dy), fill=round(180*(1-f)**2))
-    glints = Image.new("RGBA", size, "white")
-    glints.putalpha(ImageChops.multiply(sheen, layer.getchannel("A").point(
-        lambda alpha: 255 if 0 < alpha < 255 else 0)))
-    Image.alpha_composite(layer, glints).save(target)
-
-
-def inspect_video(source: Path):
-    local = ["-protocol_whitelist", "file", "-format_whitelist", FORMATS]
-    info = json.loads(run(["ffprobe", "-v", "error", *local, "-show_streams",
-                           "-show_format", "-of", "json", str(source)]))
-    video = next((s for s in info["streams"] if s["codec_type"] == "video"
-                  and not s.get("disposition", {}).get("attached_pic")), None)
-    if not video:
-        raise MediaError("Please send a file containing a video track.")
-    w, h = video["width"], video["height"]
-    rotation = next((s["rotation"] for s in video.get("side_data_list", [])
-                     if "rotation" in s), 0)
-    if abs(rotation) % 180 == 90:
-        w, h = h, w
-    if min(w, h) < 8 or w*h > 4096*2160:
-        raise MediaError("Please send a video up to 4K resolution.")
-    if video.get("color_transfer") in {"smpte2084", "arib-std-b67"}:
-        raise MediaError("Please send an SDR export so the original colours are preserved.")
-    return info, video, w, h
-
-
-@lru_cache(maxsize=1)
-def supports_nvenc():
-    # An FFmpeg build may list NVENC even on a machine without a working GPU.
-    probe = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
-         "color=size=256x256", "-frames:v", "1", "-c:v", "h264_nvenc",
-         "-preset", "p1", "-f", "null", "-"],
-        capture_output=True, timeout=20)
-    return probe.returncode == 0
-
-
-LOGO_FORMATS = "png_pipe,jpeg_pipe,gif,mov"
-
-
-def inspect_logo(path):
-    info = json.loads(run(["ffprobe", "-v", "error", "-protocol_whitelist", "file",
-                           "-format_whitelist", LOGO_FORMATS, "-show_format",
-                           "-show_streams", "-of", "json", str(path)]))
-    stream = next((s for s in info["streams"] if s["codec_type"] == "video"
-                   and not s.get("disposition", {}).get("attached_pic")), None)
-    if not stream or stream["width"] * stream["height"] > 4096 * 2160:
-        raise MediaError("Send a PNG, JPEG, GIF or MP4 logo up to 4K.")
-    return stream, info["format"]["format_name"] in {"png_pipe", "jpeg_pipe"}
-
-
-def logo_filters(path, index):
-    """Inspect small RGBA previews, keeping a single crop for the whole animation."""
-    from statistics import median
-    from PIL import ImageFilter
-    side = 96
-    args = ["ffmpeg", "-v", "error", "-protocol_whitelist", "file", "-format_whitelist",
-            LOGO_FORMATS, "-i", str(path), "-map", f"0:{index}", "-vf",
-            "select='isnan(prev_selected_t)+gte(t-prev_selected_t,0.125)',scale=96:96",
-            "-fps_mode", "vfr", "-frames:v", "960", "-pix_fmt", "rgba", "-f", "rawvideo", "-"]
-    raw = run(args)
-    stride = side * side * 4
-    if not raw:
-        raise MediaError("The logo contains no readable frames.")
-    frames = [Image.frombytes("RGBA", (side, side), raw[i:i+stride])
-              for i in range(0, len(raw), stride)]
-    edges = []
-    for frame in frames[::max(1, len(frames)//12)]:
-        for n in range(2, side-2, 8):
-            edges.extend(frame.getpixel(xy) for xy in [(n,1),(n,side-2),(1,n),(side-2,n)])
-    greens = [(r,g,b) for r,g,b,a in edges if a > 240 and g > max(r,b)+45]
-    key = None
-    prefix = ""
-    if len(greens) > len(edges)*0.70:
-        color = tuple(round(median(channel)) for channel in zip(*greens))
-        if sum(max(abs(v-c) for v,c in zip(pixel,color)) < 25 for pixel in greens) > len(edges)*0.65:
-            key = color
-            prefix = "colorkey=0x%02x%02x%02x:0.12:0.035," % key
-    union = Image.new("L", (side, side))
-    for frame in frames:
-        mask = frame.getchannel("A").point(lambda a: 255 if a > 32 else 0)
-        if key:
-            diff = ImageChops.difference(frame.convert("RGB"), Image.new("RGB",frame.size,key))
-            r,g,b = diff.split()
-            solid = ImageChops.lighter(ImageChops.lighter(r,g),b).point(lambda d: 255 if d > 42 else 0)
-            mask = ImageChops.multiply(mask, solid)
-        union = ImageChops.lighter(union, mask)
-    box = union.filter(ImageFilter.MaxFilter(5)).getbbox()
-    if box and box != (0,0,side,side) and len(frames) < 960:
-        l,t,r,b = box
-        prefix += f"crop=ceil(iw*{r-l}/96):ceil(ih*{b-t}/96):floor(iw*{l}/96):floor(ih*{t}/96),"
-        return prefix, (r-l)/side, (b-t)/side
-    return prefix, 1, 1
-
-
-def prepare_logo(path):
-    stream, still = inspect_logo(path)
-    prefix, x_fraction, y_fraction = logo_filters(path, stream["index"])
-    w, h = stream["width"], stream["height"]
-    rotation = next((x["rotation"] for x in stream.get("side_data_list", [])
-                     if "rotation" in x), 0)
-    if abs(rotation) % 180 == 90:
-        w, h = h, w
-    return stream["index"], still, prefix, math.ceil(w*x_fraction), math.ceil(h*y_fraction)
-
-
-def render(source: Path, output: Path, background: Path | None = None, logo: Path | None = None, logo_details=None):
-    info, video, w, h = inspect_video(source)
-    local = ["-protocol_whitelist", "file", "-format_whitelist", FORMATS]
-    audio = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
-    logo_only = logo is not None and background is None
-    mask_input = []
-    if logo_only:
-        graph = f"[0:{video['index']}]null[v]"
-    else:
-        mask = output.with_suffix(".png")
-        short_side = min(w, h)
-        rim = max(2, round(short_side * GLASS_WIDTH))
-        gap = max(1, round(short_side * GAP_RATIO))
-        inset = rim + gap
-        width, height = w + 2 * inset, h + 2 * inset
-        radius = inset + max(1, round(short_side * 0.047))
-        make_rim((width, height), rim, inset, radius, mask)
-        # Reflect each live edge into the added margin, including both axes at corners.
-        graph = (f"[0:{video['index']}]format=yuv444p,pad={width}:{height}:{inset}:{inset},"
-                 f"fillborders=left={inset}:right={inset}:top={inset}:bottom={inset}:mode=mirror[reflected];"
-                 "[reflected][1:v]overlay=0:0:format=yuv444,"
-                 "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p[v]")
-        mask_input = ["-i", str(mask)]
-    extra_inputs = []
-    if logo is not None:
-        index, still, prep, _, _ = logo_details or prepare_logo(logo)
-    if background is not None:
-        _, bg, bw, bh = inspect_video(background)
-        # Phone templates use square display pixels. Normalize anamorphic backgrounds.
-        sar = bg.get("sample_aspect_ratio", "1:1")
-        if sar and ":" in sar:
-            n, d = map(int, sar.split(":"))
-            if n > 0 and d > 0:
-                bw = round(bw * n / d)
-        bw, bh = max(2, bw // 2 * 2), max(2, bh // 2 * 2)
-        if bw * bh > 4096 * 2160:
-            raise MediaError("The background display resolution exceeds 4K.")
-        # Sample header ends near 19%. Keep a little breathing room below it.
-        top = 2 * round(bh * 0.23 / 2)
-        box_w = max(2, 2 * int(bw * 0.90 / 2))
-        box_h = max(2, 2 * int((bh * 0.72) / 2))
-        main_seconds = float(video.get("duration") or info["format"]["duration"])
-        if not math.isfinite(main_seconds) or main_seconds <= 0:
-            raise MediaError("The main video's duration could not be read.")
-        extra_inputs = ["-stream_loop", "-1", "-t", str(main_seconds + 1), *local, "-threads", "2", "-i", str(background)]
-        graph += (f";[v]scale={box_w}:{box_h}:force_original_aspect_ratio=decrease:"
-                  "force_divisible_by=2,setsar=1")
-        rate = video.get("avg_frame_rate")
-        if (rate and rate != "0/0" and rate == video.get("r_frame_rate")
-                and float(video.get("start_time") or 0) == 0):
-            graph += (f"[front];[2:{bg['index']}]setpts=PTS-STARTPTS,fps={rate},"
-                      f"scale={bw}:{bh},setsar=1[scene];")
-        else:
-            # Use the foreground clock to retain variable frame timestamps.
-            graph += (f",split[clock][front];[clock]pad={bw}:{bh}:0:0[canvas];"
-                      f"[2:{bg['index']}]scale={bw}:{bh},setsar=1,setpts=PTS-STARTPTS[bg];"
-                      "[canvas][bg]overlay=0:0:shortest=1[scene];")
-        graph += f"[scene][front]overlay=(W-w)/2:{top}:shortest=1[composite]"
-    video_label = "[composite]" if background is not None else "[v]"
-    if logo is not None:
-        input_number = 3 if background is not None else 1
-        if not still:
-            seconds = float(video.get("duration") or info["format"]["duration"])
-            extra_inputs += ["-stream_loop", "-1", "-t", str(seconds + 1)]
-        extra_inputs += ["-protocol_whitelist", "file", "-format_whitelist", LOGO_FORMATS,
-                         "-i", str(logo)]
-        eof = "" if still else ":shortest=1"
-        overlay_format = ":format=yuv444" if logo_only and (w % 2 or h % 2) else ""
-        canvas_w, canvas_h = (w, h) if logo_only else (bw, bh)
-        max_w = max(2, round(canvas_w * LOGO_WIDTH_FRACTION))
-        max_h = max(2, round(canvas_h * 2 * LOGO_CENTER_Y))
-        fit = (f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease:"
-               "flags=lanczos,")
-        y_position = f"max(0,{LOGO_CENTER_Y}*H-h/2)"
-        graph += (f";[{input_number}:{index}]format=rgba,{prep}{fit}setsar=1,"
-                  f"setpts=PTS-STARTPTS[mark];{video_label}[mark]overlay="
-                  f"(W-w)/2:'{y_position}'{eof}{overlay_format}[branded]")
-        video_label = "[branded]"
-    base = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-filter_complex_threads", "3",
-            *local, "-threads", "2", "-i", str(source), *mask_input,
-            *extra_inputs, "-filter_complex", graph, "-map", video_label]
-    if audio:
-        base += ["-map", f"0:{audio['index']}"]
-    base += ["-map_metadata", "-1", "-map_metadata:s", "-1", "-map_chapters", "-1",
-             "-fps_mode", "vfr", "-movflags", "+faststart"]
-    audio_opts = ["-c:a", "copy"] if audio and audio["codec_name"] == "aac" else [
-        "-c:a", "aac", "-b:a", "160k"]
-    cpu = ["-c:v", "libx264", "-preset", "veryfast", "-threads",
-           str(min(8, os.cpu_count() or 2))]
-    limit = ["-fs", str(MAX_OUTPUT + 1_000_000), str(output)]
-    encoder = cpu
-    if supports_nvenc():
-        encoder = ["-c:v", "h264_nvenc", "-preset", "p1"]
-        try:
-            run(base + encoder + ["-rc", "vbr", "-cq", "18", "-b:v", "0"] + audio_opts + limit)
-        except MediaError:
-            # Some dimensions or driver configurations are CPU-only.
-            encoder = cpu
-    if encoder == cpu:
-        run(base + cpu + ["-crf", "17"] + audio_opts + limit)
-    if output.stat().st_size <= MAX_OUTPUT:
-        return
-    duration = float(info["format"].get("duration", 0))
-    if duration <= 0 or not math.isfinite(duration):
-        raise MediaError("The output exceeds Telegram's upload limit.")
-    bitrate = int(MAX_OUTPUT * 8 * 0.90 / duration) - (128_000 if audio else 0)
-    if bitrate < 80_000:
-        raise MediaError("Please send a shorter clip to fit Telegram's upload limit.")
-    run(base + cpu + ["-b:v", str(bitrate), "-maxrate", str(bitrate),
-                "-bufsize", str(bitrate*2), "-c:a", "aac", "-b:a", "128k",
-                "-fs", str(MAX_OUTPUT+1_000_000), str(output)])
-    if output.stat().st_size > MAX_OUTPUT:
-        raise MediaError("The result is still too large. Please send a shorter clip.")
 """Telegram video worker. Run one polling instance per token."""
 import asyncio
+from telegram import InputMediaPhoto
 import logging
 import os
 import shutil
@@ -297,7 +14,7 @@ from telegram import ReplyKeyboardMarkup, ReplyParameters, Update
 from telegram.error import TelegramError, NetworkError, BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from media import MediaError, inspect_video, render, prepare_logo
+from media import MediaError, inspect_video, render, prepare_logo, preview_mark, placement_preview
 
 ROOT = Path(tempfile.gettempdir()) / "telegram-glass-video-jobs"
 LIMIT = 20 * 1024 * 1024
@@ -306,20 +23,31 @@ SET_BG = "Set background"
 REMOVE_BG = "Remove background"
 KEYBOARD = ReplyKeyboardMarkup(
     [[SET_BG], ["Logo mode", "Background + logo"], ["Change logo", "Logo off"],
-     [HELP_BUTTON, "/cancel"]],
+     ["Adjust logo", HELP_BUTTON], ["/cancel"]],
     resize_keyboard=True, is_persistent=True,
 )
+REMOVE = "Yes, remove background"
+KEEP = "No, keep original"
+BACKGROUND_KEYS = ReplyKeyboardMarkup([[REMOVE], [KEEP], ["/cancel"]], resize_keyboard=True)
+POSITION_KEYS = ReplyKeyboardMarkup([["Top half", "Bottom half"], ["/cancel"]], resize_keyboard=True)
+EDIT_ROWS = [["Top", "Bottom"], ["↑ Up", "↓ Down", "← Left", "→ Right"],
+             ["− Smaller", "+ Larger"], ["Save placement", "Discard"]]
+EDIT_KEYS = ReplyKeyboardMarkup(EDIT_ROWS, resize_keyboard=True)
 GUIDE = (
     "How to use\n\n"
-    "1. Attach your original video (up to 20 MB).\n"
-    "2. Send up to ten videos together, individually or as an album.\n"
-    "3. Save the finished MP4 from this chat.\n\n"
-    "Optional: tap Set background and send a profile clip. Future videos will appear below its header. "
-    "Tap Set background again to remove your saved background. Use /cancel to cancel setup.\n\n"
-    "Logo mode places your logo in the upper part of the original video. Background + logo uses both saved assets. "
-    "Use Change logo to replace it, or Logo off to return to your previous layout.\n\n"
-    "If the edited video looks unusual in Telegram’s preview, save it to your phone and open the MP4 in your gallery to see the full frame.\n\n"
-    "The frame reflects the movement and colours at the edges of your clip."
+    "1. For a glass frame, send a video (up to 20 MB). For a logo, tap Logo mode. "
+    "For a background too, tap Set background, send your template, then tap Background + logo.\n\n"
+    "2. Upload a tightly cropped logo, keeping its full animation inside the crop. "
+    "Choose whether to keep its original background or remove a solid colour.\n\n"
+    "3. Choose Top half or Bottom half to start. The preview shows your logo on a 9:16 grid. "
+    "Use the arrows to move it by 2% of the frame. Smaller and Larger change size by 5 points "
+    "from 10% to 100%. Top and Bottom return it to the centered preset.\n\n"
+    "4. Tap Save placement to apply it to future videos, or Discard to keep your previous settings. "
+    "Tap Adjust logo any time to reopen the preview. Logo mode follows the original video shape, "
+    "so framing can differ from the portrait preview. Background + logo exports in 9:16.\n\n"
+    "5. Send one video or a batch. Results arrive one at a time. If Telegram’s preview looks unusual, "
+    "save the MP4 and open it in your gallery. Use Change logo to replace the logo, Logo off to disable it, "
+    "or Set background again to remove the background."
 )
 
 
@@ -340,6 +68,7 @@ class StartupApplication(Application):
 
 
 async def start(update: Update, context):
+    context.user_data.pop("editor", None)
     await update.effective_message.reply_text(
         "Send a video to add a reflective glass frame. Tap the keyboard icon beside the message field to see all options.",
         reply_markup=KEYBOARD)
@@ -356,9 +85,12 @@ async def show_help(update: Update, context):
 
 
 async def logo_mode(update, context):
+    context.user_data.pop("editor", None)
     user = update.effective_user.id
     db = context.bot_data["database"]
     text = update.effective_message.text
+    context.user_data.pop("pending_background_choice", None)
+    context.user_data.pop("pending_position", None)
     context.user_data.pop("awaiting_logo", None)
     context.user_data.pop("awaiting_background", None)
     if text == "Logo off":
@@ -373,9 +105,9 @@ async def logo_mode(update, context):
     row = db.execute("SELECT mode FROM logos WHERE user_id=?", (user,)).fetchone()
     if text == "Change logo" or row is None:
         if text == "Change logo" and row:
-            mode = row[0]
+            mode = "both" if row[0] == "both" else "logo"
         context.user_data["awaiting_logo"] = (update.effective_chat.id, mode)
-        await update.effective_message.reply_text("Send a PNG, JPEG, animated GIF or MP4 logo (up to 20 MB). "
+        await update.effective_message.reply_text("First crop your file to just the logo or banner, including its full motion. Send the cropped PNG, JPEG, GIF or MP4 (up to 20 MB). "
                                                  "For transparency, send a PNG or GIF as a file. Use /cancel to exit.", reply_markup=KEYBOARD)
         return
     with db:
@@ -384,6 +116,9 @@ async def logo_mode(update, context):
 
 
 async def choose_background(update: Update, context):
+    context.user_data.pop("editor", None)
+    context.user_data.pop("pending_background_choice", None)
+    context.user_data.pop("pending_position", None)
     context.user_data.pop("awaiting_logo", None)
     db = context.bot_data["database"]
     if db.execute("SELECT 1 FROM backgrounds WHERE user_id=?", (update.effective_user.id,)).fetchone():
@@ -396,7 +131,10 @@ async def choose_background(update: Update, context):
 
 
 async def cancel_setup(update: Update, context):
+    context.user_data.pop("editor", None)
     context.user_data.pop("awaiting_background", None)
+    context.user_data.pop("pending_background_choice", None)
+    context.user_data.pop("pending_position", None)
     context.user_data.pop("awaiting_logo", None)
     await update.effective_message.reply_text("Setup closed.", reply_markup=KEYBOARD)
 
@@ -413,8 +151,117 @@ async def remove_background(update: Update, context):
     await update.effective_message.reply_text("Background removed.", reply_markup=KEYBOARD)
 
 
+async def choose_logo_background(update, context):
+    pending = context.user_data.get("pending_background_choice")
+    if not pending or pending[0] != update.effective_chat.id:
+        await update.effective_message.reply_text("Use Change logo to upload a cropped logo first.", reply_markup=KEYBOARD)
+        return
+    remove_bg = update.effective_message.text == REMOVE
+    context.user_data["pending_position"] = (*pending, remove_bg)
+    context.user_data.pop("pending_background_choice")
+    await update.effective_message.reply_text("Where should this logo appear?", reply_markup=POSITION_KEYS)
+
+
+async def open_editor(update, context):
+    message = update.effective_message
+    chat = update.effective_chat.id
+    user = update.effective_user.id
+    db = context.bot_data["database"]
+    pending = context.user_data.get("pending_position")
+    new = message.text in ("Top half", "Bottom half")
+    if new:
+        if not pending or pending[0] != chat:
+            await message.reply_text("Use Adjust logo to edit your saved logo.", reply_markup=KEYBOARD)
+            return
+        _, file_id, mode, remove = pending
+        size, x, y = 95, 50, 12 if message.text == "Top half" else 88
+    else:
+        row = db.execute("SELECT file_id, mode, remove_bg, size_pct, x_pct, y_pct FROM logos WHERE user_id=?",
+                         (user,)).fetchone()
+        if not row:
+            await message.reply_text("Tap Logo mode and upload your logo first.", reply_markup=KEYBOARD)
+            return
+        file_id, mode, remove, size, x, y = row
+    try:
+        with tempfile.TemporaryDirectory(prefix="job-", dir=ROOT) as folder:
+            path = Path(folder) / "logo"
+            cached = context.bot_data.get("recent_logo")
+            if cached and cached[0] == file_id:
+                path.write_bytes(cached[1])
+            else:
+                remote = await context.bot.get_file(file_id)
+                await remote.download_to_drive(path, read_timeout=120)
+            mark = await asyncio.to_thread(preview_mark, path, bool(remove))
+        draft = dict(chat=chat, file=file_id, mode=mode, remove=remove,
+                     size=size, x=x, y=y, mark=mark)
+        picture = await message.reply_photo(placement_preview(mark, size, x, y),
+                                            caption=editor_caption(draft), reply_markup=EDIT_KEYS)
+    except (MediaError, TelegramError):
+        await message.reply_text("Could not open the preview. Try again.", reply_markup=POSITION_KEYS if new else KEYBOARD)
+        return
+    draft["message"] = picture.message_id
+    for key in ("awaiting_logo", "awaiting_background", "pending_background_choice", "pending_position"):
+        context.user_data.pop(key, None)
+    context.user_data["editor"] = draft
+
+
+def editor_caption(d):
+    return (f"9:16 placement preview · Size {d['size']}%\n"
+            f"Target center: {d['x']}% from left, {d['y']}% from top. "
+            "Edges stop at the frame. Tap Save placement when ready.")
+
+
+async def edit_logo(update, context):
+    message = update.effective_message
+    draft = context.user_data.get("editor")
+    if not draft or draft["chat"] != update.effective_chat.id:
+        await message.reply_text("Tap Adjust logo to open the preview.", reply_markup=KEYBOARD)
+        return
+    action = message.text
+    if action in ("Save placement", "Discard"):
+        if action == "Save placement":
+            db = context.bot_data["database"]
+            with db:
+                db.execute("INSERT OR REPLACE INTO logos(user_id,file_id,mode,position,remove_bg,size_pct,x_pct,y_pct) "
+                           "VALUES(?,?,?,?,?,?,?,?)", (update.effective_user.id, draft["file"], draft["mode"],
+                           "top" if draft["y"] <= 50 else "bottom", draft["remove"], draft["size"], draft["x"], draft["y"]))
+        context.user_data.pop("editor")
+        await message.reply_text("Placement saved for future videos." if action == "Save placement" else
+                                 "Draft discarded.", reply_markup=KEYBOARD)
+        return
+    updated = draft.copy()
+    if action in ("Top", "Bottom"):
+        updated.update(x=50, y=12 if action == "Top" else 88)
+    else:
+        key, delta = {"↑ Up": ("y", -2), "↓ Down": ("y", 2), "← Left": ("x", -2),
+                      "→ Right": ("x", 2), "− Smaller": ("size", -5), "+ Larger": ("size", 5)}[action]
+        updated[key] = min(100, max(10 if key == "size" else 0, updated[key] + delta))
+    if updated == draft:
+        return
+    photo = placement_preview(updated["mark"], updated["size"], updated["x"], updated["y"])
+    try:
+        await context.bot.edit_message_media(chat_id=draft["chat"], message_id=draft["message"],
+                                             media=InputMediaPhoto(photo, caption=editor_caption(updated)))
+    except TelegramError:
+        sent = await message.reply_photo(photo, caption=editor_caption(updated), reply_markup=EDIT_KEYS)
+        updated["message"] = sent.message_id
+    context.user_data["editor"] = updated
+
+
 async def process(update: Update, context):
     message = update.effective_message
+    draft = context.user_data.get("editor")
+    if draft and draft["chat"] == update.effective_chat.id:
+        await message.reply_text("Save or discard the placement before sending a video.", reply_markup=EDIT_KEYS)
+        return
+    choice = context.user_data.get("pending_background_choice")
+    if choice and choice[0] == update.effective_chat.id:
+        await message.reply_text("Remove the logo background?", reply_markup=BACKGROUND_KEYS)
+        return
+    pending = context.user_data.get("pending_position")
+    if pending and pending[0] == update.effective_chat.id:
+        await message.reply_text("Choose a position or use /cancel.", reply_markup=POSITION_KEYS)
+        return
     setup = context.user_data.get("awaiting_logo")
     saving_logo = setup and setup[0] == update.effective_chat.id
     item = message.video or message.animation or message.document or (message.photo[-1] if message.photo else None)
@@ -432,17 +279,16 @@ async def process(update: Update, context):
                 path = Path(folder) / "logo"
                 remote = await context.bot.get_file(item.file_id)
                 await remote.download_to_drive(path, read_timeout=120)
-                details = await asyncio.to_thread(prepare_logo, path)
-                cached_logo = (item.file_id, path.read_bytes(), details)
-            with db:
-                db.execute("INSERT OR REPLACE INTO logos VALUES (?, ?, ?)", (user_id, item.file_id, setup[1]))
+                await asyncio.to_thread(prepare_logo, path, False)
+                cached_logo = (item.file_id, path.read_bytes(), None, None)
             context.bot_data["recent_logo"] = cached_logo
             context.user_data.pop("awaiting_logo", None)
-            await message.reply_text("Logo saved.", reply_markup=KEYBOARD)
+            context.user_data["pending_background_choice"] = (update.effective_chat.id, item.file_id, setup[1])
+            await message.reply_text("Remove the solid background from this logo?", reply_markup=BACKGROUND_KEYS)
         except (MediaError, TelegramError):
             await message.reply_text("Could not load that logo. Send a PNG, JPEG, GIF or MP4, or use /cancel.", reply_markup=KEYBOARD)
         return
-    logo = db.execute("SELECT file_id, mode FROM logos WHERE user_id=? AND mode!='off'", (user_id,)).fetchone()
+    logo = db.execute("SELECT file_id, mode, position, remove_bg, size_pct, x_pct, y_pct FROM logos WHERE user_id=? AND mode!='off'", (user_id,)).fetchone()
     saving = context.user_data.get("awaiting_background") == update.effective_chat.id
     row = db.execute("SELECT file_id FROM backgrounds WHERE user_id = ?", (user_id,)).fetchone()
     if saving:
@@ -492,13 +338,16 @@ async def process_file(context, message, item, user_id, row, saving, logo=None):
                 cached = context.bot_data.get("recent_logo")
                 if cached and cached[0] == logo[0]:
                     logo_path.write_bytes(cached[1])
-                    details = cached[2]
+                    if cached[3] == logo[3]:
+                        details = cached[2]
                 else:
                     mark = await context.bot.get_file(logo[0])
                     await mark.download_to_drive(logo_path, read_timeout=120)
-                    details = await asyncio.to_thread(prepare_logo, logo_path)
-                    context.bot_data["recent_logo"] = (logo[0], logo_path.read_bytes(), details)
-            await asyncio.to_thread(render, source, result, background, logo_path, details)
+                if details is None:
+                    details = await asyncio.to_thread(prepare_logo, logo_path, bool(logo[3]))
+                    context.bot_data["recent_logo"] = (logo[0], logo_path.read_bytes(), details, logo[3])
+            await asyncio.to_thread(render, source, result, background, logo_path, details, logo[2] if logo else "top",
+                                    *(logo[4:7] if logo else (95, 50, None)))
             with result.open("rb") as stream:
                 await message.reply_video(stream, filename=result.name, supports_streaming=True,
                                           caption="Your framed video is ready.",
@@ -535,6 +384,9 @@ def main():
     app = (Application.builder().application_class(StartupApplication).token(token)
            .connect_timeout(20).get_updates_connect_timeout(20)
            .concurrent_updates(False).build())
+    app.add_handler(MessageHandler(filters.Text([REMOVE, KEEP]), choose_logo_background))
+    app.add_handler(MessageHandler(filters.Text(["Adjust logo", "Top half", "Bottom half"]), open_editor))
+    app.add_handler(MessageHandler(filters.Text([label for row in EDIT_ROWS for label in row]), edit_logo))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("commands", show_commands))
     app.add_handler(MessageHandler(filters.Text(["Commands"]), show_commands))
@@ -554,6 +406,21 @@ def main():
         db.execute("CREATE TABLE IF NOT EXISTS backgrounds "
                    "(user_id INTEGER PRIMARY KEY, file_id TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS logos (user_id INTEGER PRIMARY KEY, file_id TEXT NOT NULL, mode TEXT NOT NULL)")
+        if "position" not in {col[1] for col in db.execute("PRAGMA table_info(logos)")}:
+            with db:
+                db.execute("ALTER TABLE logos ADD COLUMN position TEXT NOT NULL DEFAULT 'top'")
+        if "remove_bg" not in {col[1] for col in db.execute("PRAGMA table_info(logos)")}:
+            with db:
+                db.execute("ALTER TABLE logos ADD COLUMN remove_bg INTEGER NOT NULL DEFAULT 1")
+        columns = {col[1] for col in db.execute("PRAGMA table_info(logos)")}
+        with db:
+            if "size_pct" not in columns:
+                db.execute("ALTER TABLE logos ADD COLUMN size_pct INTEGER NOT NULL DEFAULT 95")
+            if "x_pct" not in columns:
+                db.execute("ALTER TABLE logos ADD COLUMN x_pct INTEGER NOT NULL DEFAULT 50")
+            if "y_pct" not in columns:
+                db.execute("ALTER TABLE logos ADD COLUMN y_pct INTEGER NOT NULL DEFAULT 12")
+                db.execute("UPDATE logos SET y_pct=88 WHERE position='bottom'")
         app.bot_data["database"] = db
         try:
             app.run_polling(allowed_updates=["message"])
